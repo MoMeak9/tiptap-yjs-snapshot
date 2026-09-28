@@ -1,0 +1,36 @@
+{
+  "name": "@tiptap-yjs-snapshot/v2-core",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": ["dist", "schema.postgres.sql", "README.md"],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@hocuspocus/transformer": "3.4.3",
+    "@tiptap/core": "3.29.2",
+    "@tiptap/pm": "3.29.2",
+    "yjs": "13.6.27"
+  },
+  "devDependencies": {
+    "@tiptap/starter-kit": "3.29.2",
+    "@types/node": "24.0.10",
+    "tsup": "8.5.0",
+    "typescript": "5.8.3",
+    "vitest": "3.2.4"
+  }
+}

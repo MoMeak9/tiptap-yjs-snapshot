@@ -1,0 +1,30 @@
+{
+  "name": "@tiptap-yjs-snapshot/revision-history",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "style": "dist/index.css",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./styles": "./dist/index.css"
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsup && sass --no-source-map src/styles/version-history.scss dist/index.css",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run __tests__"
+  },
+  "peerDependencies": {
+    "@tiptap/core": "^3.20.0",
+    "@tiptap/pm": "^3.20.0",
+    "lit": "^3.3.1"
+  }
+}

@@ -4,6 +4,8 @@ import { mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises
 import { join } from 'node:path'
 import { WebSocket, WebSocketServer } from 'ws'
 import * as Y from 'yjs'
+import { currentRevisionId, decodeRevisionCursor, encodeRevisionCursor } from '../../packages/v2-core/src/cursor'
+import { shouldCreateRevision } from '../../packages/v2-core/src/service'
 import { CONTENT_SCHEMA_VERSION, materialize, type Materialized } from './model'
 
 type RevisionType = 'manual' | 'auto' | 'pre_restore' | 'restore'
@@ -18,12 +20,11 @@ type Revision = {
   createdAt: string
   title: string
   contentHash: string
-  content: Record<string, unknown> | null
+  content: Record<string, unknown>
   schemaVersion: number
-  sourceFormat: 'v2_json' | 'yjs_v2'
-  state: string | null
+  sourceFormat: 'v2_json'
+  state: string
   restoredFromSnapshotId: string | null
-  migrationStatus?: 'failed'
 }
 
 type StoredDocument = {
@@ -57,6 +58,7 @@ export type SnapshotServerOptions = {
   port?: number
   dataDir?: string
   autoSnapshotIdleMs?: number
+  allowedOrigins?: string[]
 }
 
 export type SnapshotServer = {
@@ -71,8 +73,69 @@ class HttpError extends Error {
 }
 
 const BAD_REQUEST = 400
+const FORBIDDEN = 403
+const CONFLICT = 409
 const NOT_FOUND = 404
-const MAX_LEGACY_DECODE_BYTES = 8 * 1024 * 1024
+const UNSUPPORTED_MEDIA_TYPE = 415
+const HASH_PATTERN = /^[a-f0-9]{64}$/
+const REVISION_ID_PATTERN = /^[0-9a-f-]{36}$/
+const DEFAULT_FRONTEND_ORIGINS = ['http://127.0.0.1:5173', 'http://localhost:5173']
+
+function isBrowserOrigin(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  try {
+    const url = new URL(value)
+    return (url.protocol === 'http:' || url.protocol === 'https:') &&
+      url.origin === value && url.pathname === '/' && !url.search && !url.hash &&
+      !url.username && !url.password
+  } catch {
+    return false
+  }
+}
+
+function allowedOrigin(request: IncomingMessage, allowedOrigins: ReadonlySet<string>): string | null {
+  const origin = request.headers.origin
+  return origin !== undefined && allowedOrigins.has(origin) ? origin : null
+}
+
+function requireAllowedBrowserOrigin(request: IncomingMessage, allowedOrigins: ReadonlySet<string>): void {
+  if (request.headers.origin !== undefined && allowedOrigin(request, allowedOrigins) === null) {
+    throw new HttpError(FORBIDDEN, 'Origin is not allowed')
+  }
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isNativeRevision(value: unknown, id: string): value is Revision {
+  if (!isObject(value)) return false
+  return typeof value.id === 'string' && REVISION_ID_PATTERN.test(value.id) &&
+    value.documentId === id && Number.isSafeInteger(value.version) && (value.version as number) >= 0 &&
+    ['manual', 'auto', 'pre_restore', 'restore'].includes(String(value.type)) &&
+    (value.name === null || typeof value.name === 'string') &&
+    Number.isSafeInteger(value.ctime) && typeof value.createdAt === 'string' &&
+    typeof value.title === 'string' && typeof value.contentHash === 'string' &&
+    HASH_PATTERN.test(value.contentHash) && isObject(value.content) &&
+    value.schemaVersion === CONTENT_SCHEMA_VERSION && value.sourceFormat === 'v2_json' &&
+    typeof value.state === 'string' && value.state.length > 0 &&
+    (value.restoredFromSnapshotId === null ||
+      (typeof value.restoredFromSnapshotId === 'string' && REVISION_ID_PATTERN.test(value.restoredFromSnapshotId)))
+}
+
+function isNativeStored(value: unknown, id: string): value is StoredDocument {
+  if (!isObject(value)) return false
+  return value.fileVersion === 2 && value.schemaVersion === CONTENT_SCHEMA_VERSION &&
+    value.sourceFormat === 'v2_json' && value.documentId === id &&
+    Number.isSafeInteger(value.epoch) && (value.epoch as number) >= 1 &&
+    typeof value.updatedAt === 'string' && typeof value.state === 'string' && value.state.length > 0 &&
+    typeof value.title === 'string' && isObject(value.content) &&
+    typeof value.contentHash === 'string' && HASH_PATTERN.test(value.contentHash) &&
+    Number.isSafeInteger(value.revisionCount) && (value.revisionCount as number) >= 0 &&
+    (value.pendingAutoAt === null || (Number.isSafeInteger(value.pendingAutoAt) &&
+      (value.pendingAutoAt as number) >= 0)) &&
+    Array.isArray(value.revisions) && value.revisions.every(item => isNativeRevision(item, id))
+}
 
 function documentId(url: URL): string {
   const value = url.searchParams.get('doc_id') ?? 'demo'
@@ -127,39 +190,15 @@ function revisionOf(stored: StoredDocument, type: RevisionType, name: string | n
   }
 }
 
-function availability(revision: Revision): 'ready' | 'legacy_pending' | 'legacy_failed' {
-  if (revision.content !== null) return 'ready'
-  return revision.migrationStatus === 'failed' ? 'legacy_failed' : 'legacy_pending'
-}
-
 function summary(revision: Revision, revisions: Revision[]) {
   const { state: _state, content: _content, createdAt: _createdAt,
     schemaVersion: _schemaVersion,
-    sourceFormat: _sourceFormat, migrationStatus: _migrationStatus,
+    sourceFormat: _sourceFormat,
     restoredFromSnapshotId: _restoredFromSnapshotId, ...fields } = revision
-  const status = availability(revision)
   return { ...fields, createdBy: null, createdByUser: null, collaborators: [],
-    availability: status, diffEligible: status === 'ready',
-    // This StarterKit-only file adapter cannot restore a state it already
-    // failed to decode. Production can make a different capability decision.
-    restorable: Boolean(revision.state) && revision.migrationStatus !== 'failed',
+    availability: 'ready' as const, diffEligible: true, restorable: Boolean(revision.state),
     restoredFromVersion: revision.restoredFromSnapshotId === null ? null
       : revisions.find(item => item.id === revision.restoredFromSnapshotId)?.version ?? null }
-}
-
-function cursorKey(raw: string | null): { version: number; id: string } | null {
-  if (raw === null) return null
-  try {
-    const decoded = Buffer.from(raw, 'base64url')
-    if (decoded.toString('base64url') !== raw || decoded.length > 80) throw new Error('bad cursor')
-    const match = /^v2:(0|[1-9]\d*):([0-9a-f-]{36})$/.exec(decoded.toString('utf8'))
-    if (!match) throw new Error('bad cursor')
-    const version = Number(match[1])
-    if (!Number.isSafeInteger(version)) throw new Error('bad cursor')
-    return { version, id: match[2] }
-  } catch {
-    throw new HttpError(BAD_REQUEST, 'Invalid cursor')
-  }
 }
 
 async function jsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
@@ -185,7 +224,6 @@ function send(response: ServerResponse, status: number, body: unknown) {
   response.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
-    'access-control-allow-origin': 'http://127.0.0.1:5173',
   })
   response.end(JSON.stringify(body))
 }
@@ -193,9 +231,13 @@ function send(response: ServerResponse, status: number, body: unknown) {
 export async function startSnapshotServer(options: SnapshotServerOptions = {}): Promise<SnapshotServer> {
   const host = options.host ?? '127.0.0.1'
   const port = options.port ?? 3001
-  const dataDir = options.dataDir ?? join(process.cwd(), '.data')
+  const dataDir = options.dataDir ?? join(process.cwd(), '.data', 'v2-oss')
   const autoSnapshotIdleMs = options.autoSnapshotIdleMs ?? 1500
   if (!Number.isFinite(autoSnapshotIdleMs) || autoSnapshotIdleMs < 0) throw new Error('Invalid autoSnapshotIdleMs')
+  const configuredOrigins = options.allowedOrigins ?? DEFAULT_FRONTEND_ORIGINS
+  if (!Array.isArray(configuredOrigins) || configuredOrigins.length === 0 ||
+      !configuredOrigins.every(isBrowserOrigin)) throw new Error('Invalid allowedOrigins')
+  const allowedOrigins = new Set(configuredOrigins)
   await mkdir(dataDir, { recursive: true })
 
   const rooms = new Map<string, Promise<Room>>()
@@ -231,51 +273,14 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
     const loading = (async () => {
       let stored: StoredDocument
       try {
-        const raw = JSON.parse(await readFile(pathFor(id), 'utf8')) as Record<string, unknown>
-        if (raw.documentId !== id || !Array.isArray(raw.revisions) ||
-            typeof raw.state !== 'string' || !Number.isSafeInteger(raw.epoch)) {
-          throw new Error('Unsupported or corrupt document file')
-        }
-        if (raw.fileVersion === 2 && raw.schemaVersion === CONTENT_SCHEMA_VERSION &&
-            raw.sourceFormat === 'v2_json' && typeof raw.title === 'string' &&
-            typeof raw.contentHash === 'string' && raw.content && typeof raw.content === 'object' &&
-            (raw.revisionCount === undefined ||
-              (Number.isSafeInteger(raw.revisionCount) && (raw.revisionCount as number) >= 0)) &&
-            (raw.pendingAutoAt === null || typeof raw.pendingAutoAt === 'number')) {
-          // Earlier V2 sample files had no counter; migrate them lazily on the
-          // next write without guessing the number of past semantic edits.
-          stored = { ...raw, revisionCount: (raw.revisionCount as number | undefined) ?? 0 } as StoredDocument
-        } else if (raw.schemaVersion === 1 && raw.fileVersion === undefined) {
-          // The first edition of this demo stored only V2 binary state. Reading it
-          // does not rewrite legacy revisions; detail can decode/backfill one at a time.
-          const previous = raw as { documentId: string; epoch: number; updatedAt: string;
-            state: string; revisions: Array<Partial<Revision> & { id: string; state?: string }> }
-          const currentDoc = new Y.Doc()
-          try {
-            Y.applyUpdateV2(currentDoc, decodeUpdate(previous.state))
-            const current = materialize(currentDoc)
-            stored = {
-              fileVersion: 2, schemaVersion: CONTENT_SCHEMA_VERSION, sourceFormat: 'v2_json',
-              documentId: id, epoch: previous.epoch, updatedAt: previous.updatedAt,
-              state: previous.state, title: current.title, content: current.content,
-              contentHash: current.hash, revisionCount: 0, pendingAutoAt: null,
-              revisions: previous.revisions.map(item => ({
-                id: item.id, documentId: id, version: item.version ?? 0,
-                type: item.type ?? 'manual', name: item.name ?? null,
-                ctime: item.ctime ?? 0, createdAt: item.createdAt ?? new Date(0).toISOString(),
-                title: item.title ?? '', contentHash: item.contentHash ?? '',
-                content: null, schemaVersion: CONTENT_SCHEMA_VERSION, sourceFormat: 'yjs_v2',
-                state: item.state ?? null, restoredFromSnapshotId: null,
-              })),
-            }
-          } finally {
-            currentDoc.destroy()
-          }
-        } else {
-          throw new Error('Unsupported or corrupt document file')
-        }
+        const raw: unknown = JSON.parse(await readFile(pathFor(id), 'utf8'))
+        if (!isNativeStored(raw, id)) throw new HttpError(CONFLICT, 'Unsupported local document file')
+        stored = raw
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          if (error instanceof HttpError) throw error
+          throw new HttpError(CONFLICT, 'Unsupported local document file')
+        }
         const doc = new Y.Doc()
         const current = materialize(doc)
         stored = {
@@ -296,7 +301,12 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
         return { doc, stored, clients: new Set<WebSocket>() }
       }
       const doc = new Y.Doc()
-      Y.applyUpdateV2(doc, decodeUpdate(stored.state))
+      try {
+        Y.applyUpdateV2(doc, decodeUpdate(stored.state))
+      } catch {
+        doc.destroy()
+        throw new HttpError(CONFLICT, 'Unsupported local document file')
+      }
       return { doc, stored, clients: new Set<WebSocket>() }
     })()
     rooms.set(id, loading)
@@ -317,7 +327,7 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
   async function materializeAuto(room: Room): Promise<void> {
     const latest = [...room.stored.revisions]
       .sort((a, b) => b.version - a.version || b.id.localeCompare(a.id))[0]
-    if (latest?.contentHash === room.stored.contentHash && latest.title === room.stored.title) {
+    if (!shouldCreateRevision(room.stored, latest ?? null)) {
       if (room.stored.pendingAutoAt !== null) {
         const next = { ...room.stored, pendingAutoAt: null }
         await persist(next)
@@ -376,34 +386,41 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
   async function handleHttp(request: IncomingMessage, response: ServerResponse) {
     try {
       const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        requireAllowedBrowserOrigin(request, allowedOrigins)
+      }
+      const origin = allowedOrigin(request, allowedOrigins)
+      if (origin !== null) response.setHeader('access-control-allow-origin', origin)
+      response.setHeader('vary', 'Origin')
       if (request.method === 'OPTIONS') {
         response.writeHead(204, {
-          'access-control-allow-origin': 'http://127.0.0.1:5173',
           'access-control-allow-methods': 'GET, POST, OPTIONS',
           'access-control-allow-headers': 'content-type',
         })
         response.end()
         return
       }
+      if (request.method === 'POST' &&
+          request.headers['content-type']?.split(';', 1)[0].trim().toLowerCase() !== 'application/json') {
+        throw new HttpError(UNSUPPORTED_MEDIA_TYPE, 'Content-Type must be application/json')
+      }
       if (!url.pathname.startsWith('/api/revisions/')) throw new HttpError(NOT_FOUND, 'Not found')
       const id = documentId(url)
       const room = await roomFor(id)
-
-      if (request.method === 'GET' && url.pathname === '/api/revisions/current') {
-        // Sample transport compatibility only: V2 history uses detail?id=current-<docId>.
-        const value = await serialize(id, async () => {
-          return { documentId: id, title: room.stored.title, content: room.stored.content,
-            contentHash: room.stored.contentHash, epoch: room.stored.epoch,
-            updatedAt: room.stored.updatedAt }
-        })
-        return send(response, 200, { code: 0, data: value })
-      }
 
       if (request.method === 'GET' && url.pathname === '/api/revisions/list') {
         const rawLimit = url.searchParams.get('limit')
         const limit = rawLimit === null ? 20 : Number(rawLimit)
         if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new HttpError(BAD_REQUEST, 'Invalid limit')
-        const cursor = cursorKey(url.searchParams.get('cursor'))
+        const rawCursor = url.searchParams.get('cursor')
+        let cursor: ReturnType<typeof decodeRevisionCursor> | null = null
+        if (rawCursor !== null) {
+          try {
+            cursor = decodeRevisionCursor(rawCursor)
+          } catch {
+            throw new HttpError(BAD_REQUEST, 'Invalid cursor')
+          }
+        }
         const page = await serialize(id, async () => {
           const matching = [...room.stored.revisions]
             .sort((a, b) => b.version - a.version || b.id.localeCompare(a.id))
@@ -413,7 +430,7 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
           const hasMore = matching.length > selected.length
           return {
             data: selected.map(revision => summary(revision, room.stored.revisions)),
-            nextCursor: hasMore ? Buffer.from(`v2:${selected.at(-1)!.version}:${selected.at(-1)!.id}`).toString('base64url') : null,
+            nextCursor: hasMore ? encodeRevisionCursor({ version: selected.at(-1)!.version, id: selected.at(-1)!.id }) : null,
             hasMore,
           }
         })
@@ -422,12 +439,13 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
 
       if (request.method === 'GET' && url.pathname === '/api/revisions/detail') {
         const rawId = url.searchParams.get('id')
-        if (rawId?.startsWith('current-') && rawId !== `current-${id}`) {
+        const currentId = currentRevisionId(id)
+        if (rawId?.startsWith('current-') && rawId !== currentId) {
           throw new HttpError(NOT_FOUND, 'Revision not found')
         }
-        const revisionId = rawId === `current-${id}` ? rawId : requiredId(rawId)
+        const revisionId = rawId === currentId ? rawId : requiredId(rawId)
         const detail = await serialize(id, async () => {
-          if (revisionId === `current-${id}`) {
+          if (revisionId === currentId) {
             return {
               id: revisionId, documentId: id, version: -1, name: null,
               title: room.stored.title, createdBy: null, createdByUser: null,
@@ -440,39 +458,9 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
           }
           const revision = room.stored.revisions.find(item => item.id === revisionId)
           if (!revision) throw new HttpError(NOT_FOUND, 'Revision not found')
-          let decodedFromState = false
-          let resolved = revision
-          if (revision.content === null && revision.state !== null &&
-              availability(revision) !== 'legacy_failed') {
-            let content: Materialized | null = null
-            if (revision.state.length <= Math.ceil(MAX_LEGACY_DECODE_BYTES * 4 / 3) + 4 &&
-                Buffer.from(revision.state, 'base64').length <= MAX_LEGACY_DECODE_BYTES) {
-              const legacy = new Y.Doc()
-              try {
-                Y.applyUpdateV2(legacy, decodeUpdate(revision.state))
-                content = materialize(legacy)
-              } catch {
-                // Bad legacy data is an explicit unavailable state. File write
-                // errors below still propagate and leave the old row unchanged.
-              } finally {
-                legacy.destroy()
-              }
-            }
-            resolved = content === null
-              ? { ...revision, migrationStatus: 'failed' }
-              : { ...revision, content: content.content, contentHash: content.hash,
-                  schemaVersion: CONTENT_SCHEMA_VERSION }
-            const next: StoredDocument = { ...room.stored,
-              revisions: room.stored.revisions.map(item => item.id === revision.id ? resolved : item) }
-            await persist(next)
-            room.stored = next
-            decodedFromState = content !== null
-          }
-          const status = availability(resolved)
-          return { ...summary(resolved, room.stored.revisions),
-            availability: status, diffEligible: status === 'ready',
-            content: resolved.content, contentHash: resolved.content === null ? null : resolved.contentHash,
-            decodedFromState, attribution: null }
+          return { ...summary(revision, room.stored.revisions),
+            content: revision.content, contentHash: revision.contentHash,
+            decodedFromState: false, attribution: null }
         })
         return send(response, 200, { code: 0, data: detail })
       }
@@ -499,9 +487,6 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
         const restored = await serialize(id, async () => {
           const target = room.stored.revisions.find(item => item.id === revisionId)
           if (!target) throw new HttpError(NOT_FOUND, 'Revision not found')
-          if (!target.state || target.migrationStatus === 'failed') {
-            throw new HttpError(BAD_REQUEST, 'Revision has no restorable state')
-          }
           const replacement = new Y.Doc()
           let targetValue: Materialized
           try {
@@ -509,20 +494,13 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
             targetValue = materialize(replacement)
           } catch {
             replacement.destroy()
-            if (target.sourceFormat === 'yjs_v2') {
-              const unavailable: Revision = { ...target, migrationStatus: 'failed' }
-              const next: StoredDocument = { ...room.stored,
-                revisions: room.stored.revisions.map(item => item.id === target.id ? unavailable : item) }
-              await persist(next)
-              room.stored = next
-            }
             throw new HttpError(BAD_REQUEST, 'Revision state cannot be restored')
           }
 
           // Build the backup (only for a semantic change), replacement current
           // fields, and the restore audit row in one atomic file replacement.
-          const changed = room.stored.contentHash !== targetValue.hash ||
-            room.stored.title !== targetValue.title
+          const changed = shouldCreateRevision(
+            { contentHash: targetValue.hash, title: targetValue.title }, room.stored)
           const withBackup: StoredDocument = changed ? {
             ...room.stored,
             revisions: [...room.stored.revisions, revisionOf(room.stored, 'pre_restore', null)],
@@ -577,12 +555,13 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
   httpServer.on('upgrade', (request, socket, head) => {
     let id: string
     try {
+      requireAllowedBrowserOrigin(request, allowedOrigins)
       const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
       if (url.pathname !== '/collaboration') throw new HttpError(NOT_FOUND, 'Not found')
       id = documentId(url)
-    } catch {
-      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
-      socket.destroy()
+    } catch (error) {
+      const forbidden = error instanceof HttpError && error.status === FORBIDDEN
+      socket.end(`HTTP/1.1 ${forbidden ? '403 Forbidden' : '400 Bad Request'}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`)
       return
     }
     wsServer.handleUpgrade(request, socket, head, ws => {
@@ -635,7 +614,7 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
                   contentHash: value.hash,
                   schemaVersion: CONTENT_SCHEMA_VERSION,
                   revisionCount: room.stored.revisionCount +
-                    (value.hash !== room.stored.contentHash || value.title !== room.stored.title ? 1 : 0),
+                    (shouldCreateRevision({ contentHash: value.hash, title: value.title }, room.stored) ? 1 : 0),
                   pendingAutoAt: Date.now() + autoSnapshotIdleMs,
                   updatedAt: new Date().toISOString(),
                 }

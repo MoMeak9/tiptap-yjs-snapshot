@@ -198,7 +198,7 @@ function RevisionList({
             onClick={() => onSelect(revision.id)}
           >
             <span className="version-badge">V{revision.version}</span>
-            <span className="revision-text"><strong>{revision.name || `版本 ${revision.version}`}</strong><small>{revisionTime(revision)} · {revision.type === 'auto' ? '自动' : revision.type === 'manual' ? '手动' : revision.type === 'pre_restore' ? '恢复前' : '恢复'}</small>{revision.createdByUser && <small>触发：{revision.createdByUser.nickname || revision.createdByUser.username}</small>}{revision.collaborators?.length > 0 && <small>区间协作者：{revision.collaborators.map((person) => person.nickname || person.username).join('、')}</small>}{revision.restoredFromVersion != null && <small>恢复自 V{revision.restoredFromVersion}</small>}{revision.availability !== 'ready' && <small className="availability-note">{revision.availability === 'legacy_pending' ? '旧版本迁移中' : revision.availability === 'deleted' ? '已删除' : '旧版本尚不可预览'}</small>}</span>
+            <span className="revision-text"><strong>{revision.name || `版本 ${revision.version}`}</strong><small>{revisionTime(revision)} · {revision.type === 'auto' ? '自动' : revision.type === 'manual' ? '手动' : revision.type === 'pre_restore' ? '恢复前' : '恢复'}</small>{revision.createdByUser && <small>触发：{revision.createdByUser.nickname || revision.createdByUser.username}</small>}{revision.collaborators?.length > 0 && <small>区间协作者：{revision.collaborators.map((person) => person.nickname || person.username).join('、')}</small>}{revision.restoredFromVersion != null && <small>恢复自 V{revision.restoredFromVersion}</small>}{revision.availability !== 'ready' && <small className="availability-note">内容暂不可预览</small>}</span>
             <span className="revision-chevron">›</span>
           </button>
         ))}
@@ -243,7 +243,7 @@ function SnapshotPanel({ detail, comparison, comparisonTarget, loading, compareL
         <div><span className="version-badge">V{detail.version}</span><h3>{detail.name || `版本 ${detail.version}`}</h3><p>{revisionTime(detail)} · ID {detail.id}</p></div>
         {detail.restorable && <button type="button" className="restore-button" onClick={onRestore}>恢复此版本</button>}
       </div>
-      {detail.availability !== 'ready' && <p className="inline-error" role="status">{detail.availability === 'legacy_pending' ? '旧版本迁移中，正文尚不可用。' : detail.availability === 'deleted' ? '此版本已删除。' : detail.restorable ? '旧版本尚不可预览或比较，但仍可恢复。' : '旧版本尚不可用，无法预览或恢复。'}</p>}
+      {detail.availability !== 'ready' && <p className="inline-error" role="status">{detail.restorable ? '此版本正文暂不可预览或比较，但仍可恢复。' : '此版本正文暂不可预览或比较。'}</p>}
       <div className="tab-row" role="tablist" aria-label="快照视图">
         <button type="button" role="tab" aria-selected={mode === 'preview'} className={mode === 'preview' ? 'active' : ''} onClick={() => setMode('preview')}>历史预览</button>
         <button type="button" role="tab" aria-selected={mode === 'compare'} className={mode === 'compare' ? 'active' : ''} disabled={!detail.diffEligible || !detail.content} onClick={() => { setMode('compare'); void onCompare('previous') }}>对比变更</button>

@@ -2,8 +2,10 @@
   "name": "tiptap-yjs-snapshot",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
-  "description": "A runnable V2 revision history reference for Tiptap and Yjs",
+  "description": "Portable open-source V2 revision history practice code for Tiptap and Yjs",
+  "workspaces": ["packages/*"],
   "engines": {
     "node": ">=22.13.0"
   },
@@ -12,9 +14,11 @@
     "dev:server": "tsx watch src/server/main.ts",
     "dev:web": "vite --host 127.0.0.1",
     "start": "tsx src/server/main.ts",
+    "check:public": "node scripts/check-public-surface.mjs",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit",
-    "build": "npm run typecheck && vite build"
+    "typecheck": "tsc --noEmit && npm run typecheck --workspaces --if-present",
+    "build:packages": "npm run build --workspaces --if-present",
+    "build": "npm run typecheck && npm run build:packages && vite build"
   },
   "dependencies": {
     "@hocuspocus/transformer": "3.4.3",
@@ -23,6 +27,7 @@
     "@tiptap/pm": "3.29.2",
     "@tiptap/react": "3.29.2",
     "@tiptap/starter-kit": "3.29.2",
+    "lit": "3.3.1",
     "react": "19.2.0",
     "react-dom": "19.2.0",
     "ws": "8.18.3",
@@ -37,7 +42,10 @@
     "@types/react-dom": "19.2.0",
     "@types/ws": "8.18.1",
     "concurrently": "9.2.1",
+    "esbuild-sass-plugin": "3.3.1",
     "jsdom": "26.1.0",
+    "sass": "1.90.0",
+    "tsup": "8.5.0",
     "tsx": "4.21.0",
     "typescript": "5.8.3",
     "vite": "7.3.1",

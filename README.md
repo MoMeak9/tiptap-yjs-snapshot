@@ -1,56 +1,69 @@
-# Tiptap × Yjs V2 修订历史参考实现
+# Tiptap × Yjs V2 修订历史
 
-一个可在本机运行的前后端示例，提取 V2 修订历史的数据与交互契约：持久化完整 Yjs V2 状态及同源 JSON、自动和手动建版、历史预览与差异、恢复后重建协同文档。代码为独立编写的参考实现，使用公开依赖，不包含业务系统源码。
+这个仓库开放一套已经用于编辑器的 **V2 修订历史模式与实践代码**。后端的规范化、写入判定、修订物化、查询与恢复逻辑，以及前端的 API 客户端、历史控制器、结构化差异和只读查看器，均由相应源模块适配而来。公开版本移除了业务身份、私有服务、专用媒体节点和环境绑定，通过接口注入这些能力。
+
+仓库同时保留一个可在本机运行的 Tiptap + Yjs 演示，方便观察编辑、建版、比较和恢复。它使用公开核心的部分算法，采用文件存储与简单 WebSocket；生产接入应使用下述包与相应端口实现。具体模块映射和改造边界见 [V2 提取范围](docs/v2-extraction.zh-CN.md)。
 
 ![实时文档与独立历史预览](docs/demo.jpg)
 
-## 快速开始
+## 仓库结构
 
-需要 Node.js 22.13 或更新版本。仓库的 `.npmrc` 已将依赖源设为淘宝 npm 镜像 `https://registry.npmmirror.com/`。
+| 路径 | 公开内容 |
+| --- | --- |
+| [`packages/v2-core/`](packages/v2-core/README.md) | 适配后的后端 V2 算法与服务：同源 JSON/哈希、协同持久化字段、延迟物化、手动建版、游标列表、详情、恢复；附 PostgreSQL schema 与存储适配器 |
+| [`packages/revision-history/`](packages/revision-history/README.md) | 适配后的前端 V2 API、控制器、Myers/结构化差异、归属索引、Lit 历史面板与隔离的只读 ProseMirror 查看器 |
+| `src/server/`、`src/client/` | 本机文件存储、WebSocket、REST 与 StarterKit 编辑器组成的端到端演示 |
+| `docs/` | [架构流程](docs/architecture.zh-CN.md)、[数据与接口契约](docs/contract.zh-CN.md)、[来源映射与适配边界](docs/v2-extraction.zh-CN.md) |
+
+## 本机运行
+
+需要 Node.js **22.13 或更新版本**。项目的 `.npmrc` 使用淘宝 npm 镜像 `https://registry.npmmirror.com/`；也可以在安装命令中显式指定。
 
 ```bash
-npm install
+npm ci --registry=https://registry.npmmirror.com/
+npm run build:packages
 npm run dev
 ```
 
-打开 <http://127.0.0.1:5173>。服务端监听 `127.0.0.1:3001`，Vite 将 API 和 WebSocket 请求代理过去。可以打开两个浏览器窗口观察同步。编辑后等待自动修订出现，也可以通过单独的手动创建控件保存命名版本；选择版本查看只读预览与差异，再尝试恢复。运行数据保存在本地 `.data/`，已加入 `.gitignore`。
+打开 <http://127.0.0.1:5173>。API 与 WebSocket 默认监听 `127.0.0.1:3001`，Vite 代理请求。打开两个窗口即可观察协同编辑；编辑后等待自动修订，或手动保存命名版本，然后在独立历史视图中预览、比较、恢复。演示数据存于 `.data/v2-oss/`，不会进入 Git；原先本地演示数据保持原样。
+
+| 环境变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `PORT` | `3001` | 本机 API/WebSocket 端口 |
+| `DATA_DIR` | `.data/v2-oss` | 本机演示数据目录 |
+| `FRONTEND_ORIGINS` | `http://127.0.0.1:5173,http://localhost:5173` | 允许的浏览器来源，逗号分隔 |
+
+配置示例在 [`.env.example`](.env.example)；运行前将需要的值导出到环境中。前端开发地址固定为 `127.0.0.1:5173`。
 
 ```bash
 npm test
+npm run check:public
 npm run typecheck
 npm run build
 ```
 
-## 方案
+## V2 数据与恢复方式
 
 ```mermaid
 flowchart LR
-  A[实时 Tiptap 编辑器] <-->|Yjs V2 更新| B[WebSocket 协同房间]
-  B --> C[当前完整 Yjs V2 状态]
-  C --> D[修订版本存储]
-  D -->|列表与 JSON 详情| E[独立只读历史视图]
-  D -->|恢复完整 V2 状态| C
-  C -->|重置旧连接| A
+  A[实时 Tiptap / Y.Doc] --> B[完整 Yjs V2 state]
+  A --> C[规范化 Tiptap JSON、标题与哈希]
+  B --> D[当前文档与修订存储]
+  C --> D
+  D --> E[元数据分页列表]
+  D --> F[独立只读历史查看器与差异]
+  D --> G[用目标 state 替换当前文档]
+  G --> H[重置协同房间与客户端 Y.Doc]
 ```
 
-- 正文位于 `Y.XmlFragment('default')`，标题位于 `Y.Text('title')`。两者作为一个完整 Y.Doc 编码为 V2 update；单独的 Yjs snapshot 元数据不能重建正文。
-- 当前状态与修订版本一起持久化。版本详情提供 Tiptap JSON 供只读预览，完整 V2 状态用于恢复。
-- 手动版本允许相同内容重复保存；自动版本在持久化后按正文语义哈希和标题去重。
-- 恢复先保存恢复前版本，再替换当前状态，并关闭旧 WebSocket 连接。客户端重建 Y.Doc，防止旧 CRDT 内容重新合并。
-- 历史预览使用单独的只读编辑器实例，不会调用实时编辑器的 `setContent`。
+正文在 `Y.XmlFragment('default')`，标题在 `Y.Text('title')`。同一个 Y.Doc 派生完整 V2 state 和规范化 JSON：state 是恢复依据，JSON 用于详情、预览与差异。自动修订在当前状态持久化后调度，以正文语义哈希和标题判重；手动修订允许相同内容重复保存。历史查看器有独立的只读编辑器实例，不向实时编辑器写入历史 JSON。恢复后，在线客户端必须丢弃旧 Y.Doc 并重连；使用离线缓存时还须清除对应缓存，避免旧 CRDT 内容重新合并。
 
-先读 [V2 提取范围与适配差异](docs/v2-extraction.zh-CN.md)；完整流程见 [前后端方案](docs/architecture.zh-CN.md)，接口与兼容边界见 [快照契约](docs/contract.zh-CN.md)。
+## 接入边界
 
-## 目录
+`packages/v2-core` 接受宿主提供的 ProseMirror schema、`DocumentStore`、`RevisionStore`、`Scheduler`、`RoomReset`，以及可选的归属、事件和失败标记端口。仓库提供 PostgreSQL 存储参考适配；队列、跨实例房间重置、鉴权与实际协同服务由接入方实现。`packages/revision-history` 接受服务地址、鉴权、挂载点、宿主编辑器运行时和可选的只读媒体 NodeView。
 
-| 路径 | 用途 |
-| --- | --- |
-| `src/server/` | Yjs 状态、文件持久化、修订 API 与 WebSocket |
-| `src/client/` | 实时编辑器、修订列表、只读预览与恢复交互 |
-| `docs/contract.zh-CN.md` | 数据、接口、恢复和兼容性契约 |
-| `docs/architecture.zh-CN.md` | 前后端写入、预览与恢复流程 |
-| `docs/v2-extraction.zh-CN.md` | V2 合同与本地示例的适配边界 |
+本机 `src/` 演示是独立的轻量接线实现，使用核心包的规范化、游标和判重算法；它没有运行完整的 `V2HistoryService`、PostgreSQL 适配器或前端 `RevisionHistory` 扩展。默认只监听本机，没有账号体系。接入真实服务时须先完成文档读写授权、同文档事务锁、可靠任务调度、多实例房间驱逐和自定义节点的 JSON↔Yjs 往返验证。
 
-## 生产接入
+## 许可证
 
-本仓库刻意保持单进程、无账号的本机示例。接入实际服务时需要加上文档读写授权、数据库事务/锁、多实例房间驱逐、持久化队列与监控。若客户端使用 IndexedDB 离线缓存，恢复后必须清理旧文档缓存再连接。基础 schema 以外的节点和 mark 需要前后端共同声明并验证 JSON↔Yjs 往返。
+代码按 [MIT License](LICENSE) 开放。

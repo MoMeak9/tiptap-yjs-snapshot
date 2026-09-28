@@ -57,15 +57,15 @@ describe('snapshot UI', () => {
     const restores: string[] = []
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input), 'http://localhost')
-      if (url.pathname.endsWith('/list')) return json({ data: created ? [{ id: 'rev-1', documentId: 'demo', version: 1, type: 'manual', name: 'Baseline', ctime: 1790553600000, availability: 'ready', diffEligible: true, restorable: true, collaborators: [] }] : [], nextCursor: null, hasMore: false })
+      if (url.pathname.endsWith('/list')) return json({ data: created ? [{ id: 'rev-1', documentId: 'demo', version: 2, type: 'manual', name: 'Baseline', ctime: 1790553600000, availability: 'ready', diffEligible: true, restorable: true, collaborators: [] }] : [], nextCursor: null, hasMore: false })
       if (url.pathname.endsWith('/create')) {
         creates.push(JSON.parse(String(init?.body)).name)
         created = true
-        return json({ id: 'rev-1', version: 1 })
+        return json({ id: 'rev-1', version: 2 })
       }
       if (url.pathname.endsWith('/detail')) {
         const isCurrent = url.searchParams.get('id') === 'current-demo'
-        return json({ id: isCurrent ? 'current-demo' : 'rev-1', documentId: 'demo', version: isCurrent ? -1 : 1, type: isCurrent ? 'current' : 'manual', name: isCurrent ? null : 'Baseline', ctime: 1790553600000, title: isCurrent ? 'Live title' : 'Saved title', content: isCurrent ? { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: currentBody }] }] } : snapshotContent, contentHash: isCurrent ? currentBody : 'old-hash', availability: 'ready', diffEligible: true, restorable: !isCurrent, collaborators: [], attribution: null })
+        return json({ id: isCurrent ? 'current-demo' : 'rev-1', documentId: 'demo', version: isCurrent ? -1 : 2, type: isCurrent ? 'current' : 'manual', name: isCurrent ? null : 'Baseline', ctime: 1790553600000, title: isCurrent ? 'Live title' : 'Saved title', content: isCurrent ? { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: currentBody }] }] } : snapshotContent, contentHash: isCurrent ? currentBody : 'old-hash', availability: 'ready', diffEligible: true, restorable: !isCurrent, collaborators: [], attribution: null })
       }
       if (url.pathname.endsWith('/restore')) {
         restores.push(JSON.parse(String(init?.body)).id)
@@ -100,10 +100,10 @@ describe('snapshot UI', () => {
     expect(screen.getByText(/处变更/)).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: '恢复此版本' }))
-    expect(screen.getByRole('dialog', { name: '恢复版本 V1？' })).toBeTruthy()
+    expect(screen.getByRole('dialog', { name: '恢复版本 V2？' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: '确认恢复' }))
     await waitFor(() => expect(restores).toEqual(['rev-1']))
-    expect(await screen.findByText(/已恢复版本 V1/)).toBeTruthy()
+    expect(await screen.findByText(/已恢复版本 V2/)).toBeTruthy()
     expect(FakeWebSocket.instances).toHaveLength(2)
   })
 
@@ -155,20 +155,41 @@ describe('snapshot UI', () => {
     expect(document.querySelector('[aria-label="实时正文编辑器"]')?.getAttribute('contenteditable')).toBe('true')
   })
 
-  it('requests a pending previous detail so on-demand decoding can make it diff eligible', async () => {
+  it('uses a generic message when V2 metadata says content cannot be previewed', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname.endsWith('/list')) return json({ data: [
+        { id: 'unavailable', documentId: 'demo', version: 2, name: null, type: 'auto', ctime: 1790553600000, availability: 'deleted', diffEligible: false, restorable: false, collaborators: [] },
+      ], nextCursor: null, hasMore: false })
+      if (url.pathname.endsWith('/detail')) return json({
+        id: 'unavailable', documentId: 'demo', version: 2, name: null, type: 'auto', ctime: 1790553600000,
+        title: '版本标题', content: null, contentHash: null, availability: 'deleted', diffEligible: false, restorable: false, attribution: null,
+      })
+      throw new Error(`Unexpected request: ${url.pathname}`)
+    })
+    vi.stubGlobal('fetch', fetcher)
+    const { App } = await import('./App')
+    render(<App />)
+    fireEvent.click(screen.getByRole('button', { name: '打开版本历史' }))
+
+    expect(await screen.findByText('此版本正文暂不可预览或比较。')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '恢复此版本' })).toBeNull()
+  })
+
+  it('rechecks a previous revision in detail when list comparison metadata has changed', async () => {
     const requestedDetails: string[] = []
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input), 'http://localhost')
       if (url.pathname.endsWith('/list')) return json({ data: [
         { id: 'new', documentId: 'demo', version: 2, name: null, type: 'auto', ctime: 1790553600000, availability: 'ready', diffEligible: true, restorable: true, collaborators: [] },
-        { id: 'pending', documentId: 'demo', version: 1, name: null, type: 'auto', ctime: 1790550000000, availability: 'legacy_pending', diffEligible: false, restorable: true, collaborators: [] },
+        { id: 'earlier', documentId: 'demo', version: 1, name: null, type: 'auto', ctime: 1790550000000, availability: 'ready', diffEligible: false, restorable: true, collaborators: [] },
       ], nextCursor: null, hasMore: false })
       if (url.pathname.endsWith('/detail')) {
         const id = url.searchParams.get('id')!
         requestedDetails.push(id)
         return json({ id, documentId: 'demo', version: id === 'new' ? 2 : 1, name: null, type: 'auto', ctime: 1790553600000,
           title: '标题', content: { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: id === 'new' ? '你好新' : '你好' }] }] },
-          contentHash: id, availability: 'ready', diffEligible: true, restorable: true, collaborators: [], attribution: null, decodedFromState: id === 'pending',
+          contentHash: id, availability: 'ready', diffEligible: true, restorable: true, collaborators: [], attribution: null,
         })
       }
       throw new Error(`Unexpected request: ${url.pathname}`)
@@ -180,52 +201,7 @@ describe('snapshot UI', () => {
     fireEvent.click(await screen.findByRole('tab', { name: '对比变更' }))
 
     expect(await screen.findByText(/新增.*新/)).toBeTruthy()
-    expect(requestedDetails).toContain('pending')
-  })
-
-  it('shows V2 availability and prevents restore of a pending legacy revision', async () => {
-    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input), 'http://localhost')
-      if (url.pathname.endsWith('/list')) return json({ data: [
-        { id: 'legacy', documentId: 'demo', version: 1, type: 'auto', ctime: 1790553600000, availability: 'legacy_pending', diffEligible: false, restorable: false, collaborators: [] },
-      ], nextCursor: null, hasMore: false })
-      if (url.pathname.endsWith('/detail')) return json({
-        id: 'legacy', documentId: 'demo', version: 1, type: 'auto', ctime: 1790553600000,
-        title: '旧标题', content: null, contentHash: null, availability: 'legacy_pending', diffEligible: false, restorable: false, attribution: null,
-      })
-      throw new Error(`Unexpected request: ${url.pathname}`)
-    })
-    vi.stubGlobal('fetch', fetcher)
-    const { App } = await import('./App')
-    render(<App />)
-
-    fireEvent.click(screen.getByRole('button', { name: '打开版本历史' }))
-    expect(await screen.findByText(/迁移中|尚不可用/)).toBeTruthy()
-    expect(screen.queryByRole('button', { name: '恢复此版本' })).toBeNull()
-  })
-
-  it('offers restore for a legacy failure when state remains restorable without preview or attribution', async () => {
-    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input), 'http://localhost')
-      if (url.pathname.endsWith('/list')) return json({ data: [
-        { id: 'legacy', documentId: 'demo', version: 1, name: null, type: 'auto', ctime: 1790553600000, createdBy: 'trigger-user', createdByUser: { username: 'trigger-user', nickname: '触发者' }, collaborators: [], availability: 'legacy_failed', diffEligible: false, restorable: true },
-      ], nextCursor: null, hasMore: false })
-      if (url.pathname.endsWith('/detail')) return json({
-        id: 'legacy', documentId: 'demo', version: 1, name: null, type: 'auto', ctime: 1790553600000,
-        title: '旧标题', content: null, contentHash: null, availability: 'legacy_failed', diffEligible: false, restorable: true, attribution: null, collaborators: [],
-      })
-      throw new Error(`Unexpected request: ${url.pathname}`)
-    })
-    vi.stubGlobal('fetch', fetcher)
-    const { App } = await import('./App')
-    render(<App />)
-
-    fireEvent.click(screen.getByRole('button', { name: '打开版本历史' }))
-    expect(await screen.findByText(/仍可恢复/)).toBeTruthy()
-    expect(screen.getByRole('button', { name: '恢复此版本' })).toBeTruthy()
-    expect(screen.getByRole('tab', { name: '对比变更' })).toHaveProperty('disabled', true)
-    expect(screen.getByText('触发：触发者')).toBeTruthy()
-    expect(screen.getByText(/逐项作者归属不可用/)).toBeTruthy()
+    expect(requestedDetails).toContain('earlier')
   })
 
   it('refreshes the list when history opens so newly automatic revisions are found', async () => {
