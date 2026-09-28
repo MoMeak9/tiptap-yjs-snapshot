@@ -26,8 +26,8 @@ const CLASS_BY_KIND: Readonly<Record<RevisionChange['kind'], string>> =
   })
 
 /**
- * Block-level counterparts, mirroring outline's `diffNodeInsertion` /
- * `diffNodeDeletion` split.
+ * Block-level insertion and deletion are presented separately, following the
+ * revision-history interaction pattern referenced from Outline's public UI.
  *
  * Only the two kinds that can be block-level are listed. `marks-changed` /
  * `attrs-changed` always describe inline runs.

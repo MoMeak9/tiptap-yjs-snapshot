@@ -6,15 +6,24 @@ export interface RevisionQueueDriver {
   get(jobId: string): Promise<{ readonly job: RevisionJob; remove(): Promise<void> } | null>
 }
 
+export interface DelayedJobMarker {
+  readonly jobId: string
+  readonly enqueuedAt: number
+  readonly ttlMs: number
+}
+
 /** Cross-instance registry. Keys expire after the delayed window plus a margin. */
 export interface DelayedJobRegistry {
-  set(documentId: string, jobId: string, ttlMs: number): Promise<void>
-  get(documentId: string): Promise<string | null>
-  delete(documentId: string): Promise<void>
+  /** Atomically register only if this job is newer than the current marker. */
+  set(documentId: string, jobId: string, enqueuedAt: number, ttlMs: number): Promise<boolean>
+  /** Atomically return and remove the current marker; a later registration must survive. */
+  take(documentId: string): Promise<DelayedJobMarker | null>
+  /** Restore a claimed marker only when no new marker has appeared. */
+  restore(documentId: string, marker: DelayedJobMarker): Promise<boolean>
 }
 
 export interface SchedulerFailure {
-  readonly operation: 'enqueue_delayed' | 'enqueue_create' | 'register_delayed' | 'cancel_delayed'
+  readonly operation: 'enqueue_delayed' | 'enqueue_create' | 'register_delayed' | 'cancel_delayed' | 'restore_delayed'
   readonly errorClass: string
 }
 
@@ -33,7 +42,7 @@ export function createDurableScheduler(
       try { jobId = await queue.add('delayed', job, delayMs) }
       catch (error) { warn('enqueue_delayed', error); return null }
       if (jobId !== null) {
-        try { await registry.set(job.documentId, jobId, delayMs + 60_000) }
+        try { await registry.set(job.documentId, jobId, job.enqueuedAt, delayMs + 60_000) }
         catch (error) { warn('register_delayed', error) }
       }
       return jobId
@@ -43,16 +52,21 @@ export function createDurableScheduler(
       catch (error) { warn('enqueue_create', error); return null }
     },
     async cancelDelayed(documentId) {
+      let claimed: DelayedJobMarker | null = null
       try {
-        const jobId = await registry.get(documentId)
-        if (jobId === null) return
-        await registry.delete(documentId)
-        const pending = await queue.get(jobId)
+        claimed = await registry.take(documentId)
+        if (claimed === null) return
+        const pending = await queue.get(claimed.jobId)
         if (pending?.job.documentId !== documentId) return
         await pending.remove()
       } catch (error) {
         // A running job cannot be removed; its locked dedupe check will skip it.
+        // A transient queue failure retains the marker for a later cancellation.
         warn('cancel_delayed', error)
+        if (claimed !== null) {
+          try { await registry.restore(documentId, claimed) }
+          catch (restoreError) { warn('restore_delayed', restoreError) }
+        }
       }
     },
   }

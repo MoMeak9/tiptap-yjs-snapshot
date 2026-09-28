@@ -13,7 +13,7 @@
       "require": "./dist/index.cjs"
     }
   },
-  "files": ["dist", "schema.postgres.sql", "README.md"],
+  "files": ["dist", "schema.postgres.sql", "README.md", "README.en.md"],
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json",

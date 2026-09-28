@@ -1,6 +1,12 @@
 # V2 实践代码的公开适配范围
 
+[English](v2-extraction.en.md) · 简体中文
+
 本仓库的主要交付物是由现有 **V2 修订历史实现**改造的可复用前后端代码。这里的 V2 是修订历史的数据与交互契约：当前文档和每条可恢复修订保存同源的完整 Yjs V2 state 与规范化 Tiptap JSON；列表、详情、比较、归属和恢复围绕这两份表示协作。`Y.encodeSnapshotV2` 的轻量元数据不能独立还原正文。
+
+## 设计参考与代码来源
+
+[Outline](https://github.com/outline/outline) 启发了延迟建版、正文加标题判重、虚拟当前版本、只传元数据的列表以及行内/块级差异展示。本项目另行实现完整 Yjs V2 state + JSON 双表示、CJK 词边界、游标分页和在线协同恢复。下面映射的是**本项目自身 V2 源模块**到公开包的适配；本仓库不内置 Outline 源码。[Outline 仓库采用 BSL 1.1](https://github.com/outline/outline/blob/main/LICENSE)；本仓库代码采用 [MIT](../LICENSE)。
 
 公开适配保留算法、状态机和关键写入顺序；将业务数据库、鉴权、协同房间、队列、用户目录和媒体渲染改为通用接口或去除。下表中的“源模块”是相对源代码库的路径，便于读者对照职责；公开包内代码经过脱敏、重命名及通用环境改造。
 
@@ -10,13 +16,15 @@
 | --- | --- | --- |
 | `packages/server/src/modules/history-core/{canonicalize,content-hash,schema-version}.ts` | `packages/v2-core/src/canonical.ts` | Schema round-trip、固定序列化顺序、内容哈希与版本门禁；Schema 由宿主注入，未知节点类型以可观察的降级路径处理 |
 | `packages/server/src/modules/revision-persistence/document-history-fields.ts` | `packages/v2-core/src/document-history.ts` | 锁外准备 JSON/哈希、锁内比较业务变化，保持 state、JSON、标题、哈希和修订计数的一致写入 |
-| `packages/server/src/modules/revision-queue/{revision-dedup,revision-queue.processor,revision-queue.service}.ts` | `packages/v2-core/src/service.ts`、`src/adapters/scheduler.ts` | 持久化后延迟调度、断连触发、锁前与锁内两次判重、区间归属的 claim/restore；队列与登记表由宿主提供 |
+| `packages/server/src/modules/revision-queue/{revision-dedup,revision-queue.processor,revision-queue.service}.ts` | `packages/v2-core/src/service.ts`、`src/adapters/{scheduler,redis}.ts` | 持久化后延迟调度、断连触发、锁前与锁内两次判重、区间归属的 claim/restore；队列与登记表可由宿主提供或使用标准环境适配器 |
 | `packages/server/src/modules/revision-persistence/revision-insert.ts` | `packages/v2-core/src/adapters/postgres.ts`、`schema.postgres.sql` | 统一插入字段、文档锁下分配递增版本与时间；公开参考适配改用 PostgreSQL，不依赖源系统的 ORM 或表名 |
 | `packages/server/src/modules/revision-manual/revision-manual.service.ts` | `V2HistoryService.createManual` | 手动命名版本允许相同内容重复保存 |
 | `packages/server/src/modules/revision-list/{revision-cursor,revision-current,revision-list.service,revision-detail.service}.ts` | `packages/v2-core/src/cursor.ts`、`service.ts` | 不透明游标、仅元数据的列表、`current-<documentId>` 虚拟当前详情和按文档隔离的读取 |
 | `packages/server/src/modules/snapshot/snapshot.service.ts` 中的 V2 恢复链路 | `V2HistoryService.restore`、`state-codec.ts`、`RoomReset` 端口 | 使用目标原始完整 V2 state 替换当前文档、保存恢复前状态、记恢复来源、重置活跃协同房间 |
 
 后端包的入口是 `packages/v2-core/src/index.ts`。`DocumentStore`、`RevisionStore`、`Scheduler`、`RoomReset`、可选的 `IntervalPort` / `EventPublisher` / 失败标记端口定义在 `ports.ts`。HTTP 控制器和身份授权属于宿主层；在调用 `list`、`detail`、`createManual` 或 `restore` 前，宿主必须验证文档访问权限，再构造 `DocumentContext`。PostgreSQL schema 与驱动包装示例见 [`packages/v2-core/README.md`](../packages/v2-core/README.md)。
+
+队列适配是通用化改造：源环境的代理命令限制处理未移植，公开版本通过结构化 BullMQ 驱动与标准 Redis 6.2+ 的 `EVAL` / `GETDEL` 登记表接入；也可以注入其他持久队列与 TTL 登记表。这一适配只处理修订任务，不提供协同文档或 awareness 同步；房间重置仍由独立的 `RoomReset` 端口承担。Cluster 同槽要求见[后端包说明](../packages/v2-core/README.md)。
 
 ## 前端模块映射
 

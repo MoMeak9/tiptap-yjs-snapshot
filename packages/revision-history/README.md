@@ -1,8 +1,19 @@
 # V2 revision history client
 
+English · [简体中文](README.zh-CN.md)
+
 This package opens a stored V2 revision list, compares canonical Tiptap JSON bodies in the browser, paints attributed changes, renders historical content in an isolated read-only ProseMirror `EditorView`, and sends an explicit restore request. It is adapted from an editor's production V2 revision-history module; names, palette, environment wiring, and media renderers have been replaced for public use. The source algorithms and controller lifecycle are preserved. No document text or account fixtures from the source system are included.
 
+[Outline](https://github.com/outline/outline) is a design reference for inline/block history diff and surrounding revision interactions. CJK tokenization, the V2 API/controller integration, and live restore behavior here are this project's adaptations. The package does not vendor Outline code. See the [repository-level provenance](../../docs/v2-extraction.en.md) and licenses ([Outline BSL 1.1](https://github.com/outline/outline/blob/main/LICENSE), [this repository MIT](../../LICENSE)).
+
 ## Integration
+
+From the repository root, install through the configured Taobao npm mirror and build the packages:
+
+```sh
+npm ci --registry=https://registry.npmmirror.com/
+npm run build:packages
+```
 
 Install compatible `@tiptap/core`, `@tiptap/pm`, and `lit`, build this package, and load `@tiptap-yjs-snapshot/revision-history/styles`. Mount the sidebar and the viewer in separate host elements. The host owns the live editor and collaboration provider:
 

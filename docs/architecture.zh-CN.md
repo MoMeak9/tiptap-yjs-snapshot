@@ -1,6 +1,10 @@
 # V2 修订历史的前后端架构
 
+[English](architecture.en.md) · 简体中文
+
 本页描述公开的实践代码如何接入真实协同编辑服务，以及仓库中的本机演示如何验证链路。模块来源与适配边界见 [V2 提取范围](v2-extraction.zh-CN.md)，字段和 HTTP 示例见 [契约](contract.zh-CN.md)。
+
+[Outline](https://github.com/outline/outline) 是延迟建版、正文与标题判重、虚拟当前版本、元数据列表和行内/块级差异的设计参考。本项目的 Yjs V2 state + JSON、CJK 差异、游标分页与在线恢复另有实现约束；详见 [来源说明](v2-extraction.zh-CN.md)。
 
 ## 1. 两份同源表示
 

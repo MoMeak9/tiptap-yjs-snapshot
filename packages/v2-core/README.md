@@ -1,9 +1,13 @@
 # V2 修订历史核心与后端适配
 
+[English](README.en.md) · 简体中文
+
 这个包把修订历史的**写入判定和生命周期**从具体服务框架中抽出。它直接使用 ProseMirror JSON、Tiptap Transformer 和 Yjs V2 update；数据库、持久队列、房间重置、通知由公开接口注入。仓库内的 `schema.postgres.sql` 与 `PostgresDocumentStore` / `PostgresRevisionStore` 是可运行环境的数据库参考实现。
 
+[Outline](https://github.com/outline/outline) 是延迟建版、正文与标题判重、虚拟当前版本及元数据列表的设计参考。完整 Yjs V2 state + JSON、游标和在线恢复是本项目的适配；本包不集成 Outline 源码。代码来源与许可见[仓库说明](../../docs/v2-extraction.zh-CN.md)（[Outline BSL 1.1](https://github.com/outline/outline/blob/main/LICENSE)，[本仓库 MIT](../../LICENSE)）。
+
 ```sh
-npm install --registry=https://registry.npmmirror.com
+npm ci --registry=https://registry.npmmirror.com/
 npm run test --workspace=@tiptap-yjs-snapshot/v2-core
 npm run build --workspace=@tiptap-yjs-snapshot/v2-core
 ```
@@ -55,30 +59,24 @@ const revisions = new PostgresRevisionStore(sql)
 
 ## 接入队列与房间
 
-`createDurableScheduler` 需要共享持久队列和带 TTL 的跨实例登记表。BullMQ + Redis 是一种实现；这里的包装只使用其普通 `add/getJob/remove` 和 Redis `get/set/del` 行为。
+`createDurableScheduler` 需要共享持久队列和带 TTL 的跨实例登记表。公开包提供 `createBullMQRevisionQueueDriver` 和 `createRedisDelayedJobRegistry` 作为标准接入适配器；它们接受结构化接口，不把 BullMQ 或 ioredis 设为包的运行时依赖。宿主可选用兼容的 BullMQ Queue 与 ioredis Redis/Cluster 实例，或自己实现两个端口。
+
+Redis 登记表使用标准 `EVAL` 脚本对同文档任务执行按 `enqueuedAt` 的 newest-wins 登记，并通过原子 [`GETDEL`](https://redis.io/docs/latest/commands/getdel/) 领取待取消标记；队列操作失败时仅在没有更新标记的情况下恢复它。需要 Redis 6.2+。队列适配器使用普通 BullMQ `add/getJob` 与 Job `remove`。公开通用接入不需要源环境的代理兼容处理（`EVALSHA`、`CLIENT SETNAME`、`MULTI/EXEC`、`INFO`）；这里的 `EVAL` 是标准 Redis 原子比较写入。
 
 ```ts
-import { createDurableScheduler, type RoomReset } from '@tiptap-yjs-snapshot/v2-core'
+import {
+  createBullMQRevisionQueueDriver,
+  createDurableScheduler,
+  createRedisDelayedJobRegistry,
+  type RoomReset,
+} from '@tiptap-yjs-snapshot/v2-core'
 
-const scheduler = createDurableScheduler(
-  {
-    add: async (kind, job, delayMs) => {
-      const added = await queue.add(kind, job, { delay: delayMs })
-      return added.id == null ? null : String(added.id)
-    },
-    get: async id => {
-      const found = await queue.getJob(id)
-      return found ? { job: found.data, remove: () => found.remove() } : null
-    },
-  },
-  {
-    set: async (documentId, jobId, ttlMs) => {
-      await redis.set(`revision:delayed:${documentId}`, jobId, 'PX', ttlMs)
-    },
-    get: documentId => redis.get(`revision:delayed:${documentId}`),
-    delete: async documentId => { await redis.del(`revision:delayed:${documentId}`) },
-  },
-)
+// `queue` is a host-created BullMQ Queue; `redis` is its own ioredis client.
+const registry = createRedisDelayedJobRegistry(redis, {
+  keyPrefix: 'revision:delayed-job:',
+})
+const driver = createBullMQRevisionQueueDriver(queue)
+const scheduler = createDurableScheduler(driver, registry)
 
 const roomReset: RoomReset = {
   flushAndReset: (documentId, reason, persist) =>
@@ -92,6 +90,10 @@ const roomReset: RoomReset = {
 ```
 
 `roomGate`、`collaboration`、`queue` 和 `redis` 是宿主应用提供的实例。`roomGate` 需要覆盖同一文档的全部写方与房间加载方；跨实例广播必须能到达别的服务器。若有浏览器离线副本，reset 事件还须清理 IndexedDB 中对应文档的副本。不能仅替换数据库 state：已连接的旧 Y.Doc 会把恢复前内容再次合并回去。
+
+使用 Redis Cluster 时，BullMQ Queue 与 Worker 应配置相同的、带 hash tag 的 BullMQ `prefix`，例如 `{revision-history}`，使队列多键操作处于同一 slot；不要使用 ioredis 的 `keyPrefix` 代替 BullMQ `prefix`。登记表的 `keyPrefix` 独立于队列前缀；每个文档生成 `:current` 与 `:newest` 两个键，使用相同的文档 hash tag，使双键 `EVAL` 保持同槽。`GETDEL` 只操作 `:current`。详见 [BullMQ Cluster 指南](https://docs.bullmq.io/patterns/redis-cluster)与[连接指南](https://docs.bullmq.io/guide/connections)。
+
+这个 Redis 适配器只处理延迟任务登记，不会开启协同服务器之间的文档或 awareness 同步；`RoomReset` 与实际协同同步仍由宿主独立实现。
 
 ## 协同保存与任务处理
 
@@ -108,7 +110,7 @@ const history = new V2HistoryService({
   revisions,
   scheduler,
   roomReset,
-  failureMarker, // 例如 Redis；记录 canonicalize 结构失败时的陈旧哈希
+  failureMarker, // 宿主提供的跨实例标记；记录 canonicalize 结构失败时的陈旧哈希
   interval,      // 可选：Yjs 贡献者与删除归属区间的 claim/restore
   events,        // 可选：通知失败不回滚已写入修订
 })
@@ -161,3 +163,5 @@ HTTP 层必须先完成鉴权，然后从已验证的身份与文档关系构造
 | `snapshot.service` 的恢复链路 | `V2HistoryService.restore` + `RoomReset.flushAndReset` + `yjsV2StateCodec` |
 
 本包包含纯 V2 修订写读与 PostgreSQL / 持久调度实践。业务节点 schema、真实身份与归属提取、房间广播和队列驱动由宿主接入；这些接口刻意不含私有 SDK、内部 URL、真实用户或文档数据。
+
+源系统的队列使用过代理兼容处理；公开的 BullMQ + Redis 6.2+ 适配是面向标准环境的通用化改造，并非对源队列工厂逐字移植。更多前后端源码映射见[提取范围](../../docs/v2-extraction.zh-CN.md)。

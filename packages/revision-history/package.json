@@ -16,7 +16,7 @@
     },
     "./styles": "./dist/index.css"
   },
-  "files": ["dist", "README.md"],
+  "files": ["dist", "README.md", "README.zh-CN.md", "docs/diff-algorithm.md", "docs/diff-algorithm.en.md"],
   "scripts": {
     "build": "tsup && sass --no-source-map src/styles/version-history.scss dist/index.css",
     "typecheck": "tsc -p tsconfig.json --noEmit",

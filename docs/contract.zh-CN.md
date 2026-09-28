@@ -1,6 +1,10 @@
 # V2 修订历史数据与接口契约
 
+[English](contract.en.md) · 简体中文
+
 本仓库公开从现有 V2 修订历史链路适配的前后端实践代码，并附本机运行的集成演示。本页区分**可复用包的接口**与 **`src/` 演示的 HTTP/WebSocket**。来源模块、脱敏与通用环境改造见 [提取范围](v2-extraction.zh-CN.md)。
+
+[Outline](https://github.com/outline/outline) 提供修订历史交互的设计参考；本页定义的是本项目的完整 Yjs V2 state + JSON、游标和在线恢复契约。公开代码来自本项目的 V2 模块，未内置 Outline 源码。
 
 ## 核心数据不变量
 

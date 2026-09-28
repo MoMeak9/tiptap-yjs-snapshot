@@ -1,8 +1,12 @@
 # Tiptap × Yjs V2 修订历史
 
+[English](README.en.md) · 简体中文
+
 这个仓库开放一套已经用于编辑器的 **V2 修订历史模式与实践代码**。后端的规范化、写入判定、修订物化、查询与恢复逻辑，以及前端的 API 客户端、历史控制器、结构化差异和只读查看器，均由相应源模块适配而来。公开版本移除了业务身份、私有服务、专用媒体节点和环境绑定，通过接口注入这些能力。
 
 仓库同时保留一个可在本机运行的 Tiptap + Yjs 演示，方便观察编辑、建版、比较和恢复。它使用公开核心的部分算法，采用文件存储与简单 WebSocket；生产接入应使用下述包与相应端口实现。具体模块映射和改造边界见 [V2 提取范围](docs/v2-extraction.zh-CN.md)。
+
+修订历史的延迟建版、正文加标题判重、虚拟当前版本、元数据列表及行内/块级差异，以 [Outline](https://github.com/outline/outline) 为**设计参考**。本项目的完整 Yjs V2 state + JSON、CJK 差异、游标分页和在线协同恢复是针对自身环境实现的实践。公开代码来自本项目 V2 模块的脱敏与通用化改造，未内置 Outline 源码。[Outline 使用 BSL 1.1](https://github.com/outline/outline/blob/main/LICENSE)；本仓库代码按 [MIT](LICENSE) 发布。
 
 ![实时文档与独立历史预览](docs/demo.jpg)
 
@@ -11,7 +15,7 @@
 | 路径 | 公开内容 |
 | --- | --- |
 | [`packages/v2-core/`](packages/v2-core/README.md) | 适配后的后端 V2 算法与服务：同源 JSON/哈希、协同持久化字段、延迟物化、手动建版、游标列表、详情、恢复；附 PostgreSQL schema 与存储适配器 |
-| [`packages/revision-history/`](packages/revision-history/README.md) | 适配后的前端 V2 API、控制器、Myers/结构化差异、归属索引、Lit 历史面板与隔离的只读 ProseMirror 查看器 |
+| [`packages/revision-history/`](packages/revision-history/README.zh-CN.md) | 适配后的前端 V2 API、控制器、Myers/结构化差异、归属索引、Lit 历史面板与隔离的只读 ProseMirror 查看器 |
 | `src/server/`、`src/client/` | 本机文件存储、WebSocket、REST 与 StarterKit 编辑器组成的端到端演示 |
 | `docs/` | [架构流程](docs/architecture.zh-CN.md)、[数据与接口契约](docs/contract.zh-CN.md)、[来源映射与适配边界](docs/v2-extraction.zh-CN.md) |
 
@@ -61,6 +65,8 @@ flowchart LR
 ## 接入边界
 
 `packages/v2-core` 接受宿主提供的 ProseMirror schema、`DocumentStore`、`RevisionStore`、`Scheduler`、`RoomReset`，以及可选的归属、事件和失败标记端口。仓库提供 PostgreSQL 存储参考适配；队列、跨实例房间重置、鉴权与实际协同服务由接入方实现。`packages/revision-history` 接受服务地址、鉴权、挂载点、宿主编辑器运行时和可选的只读媒体 NodeView。
+
+标准 Redis 接入可选用 `createRedisDelayedJobRegistry`（Redis 6.2+ 的 [`GETDEL`](https://redis.io/docs/latest/commands/getdel/) 与标准 `EVAL`）和 `createBullMQRevisionQueueDriver`，再交给 `createDurableScheduler`；接口也允许替换其他持久队列和 TTL 登记表。Redis Cluster 下登记表的同文档键共用 hash tag，BullMQ 的 Queue/Worker 另行共用一个队列 hash tag。完整接线见 [后端包说明](packages/v2-core/README.md)。
 
 本机 `src/` 演示是独立的轻量接线实现，使用核心包的规范化、游标和判重算法；它没有运行完整的 `V2HistoryService`、PostgreSQL 适配器或前端 `RevisionHistory` 扩展。默认只监听本机，没有账号体系。接入真实服务时须先完成文档读写授权、同文档事务锁、可靠任务调度、多实例房间驱逐和自定义节点的 JSON↔Yjs 往返验证。
 

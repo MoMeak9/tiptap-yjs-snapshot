@@ -1,8 +1,12 @@
 # 版本历史 Diff 算法
 
+[English](diff-algorithm.en.md) · 简体中文
+
 本文档梳理 `src/diff/` 下的 diff 逻辑：从两份 ProseMirror 文档到带归属的高亮装饰。
 
 对应实现：`tokenize.ts`、`diff-documents.ts`、`attribution.ts`、`change-groups.ts`、`diff-decorations.ts`。
+
+[Outline](https://github.com/outline/outline) 是行内/块级差异展示的设计参考；CJK 分词、位置预算和归属索引是本项目的 V2 实践。本包不内置 [Outline BSL 1.1](https://github.com/outline/outline/blob/main/LICENSE) 源码。本文的服务端归属生成段落描述**宿主接入约束**：公开后端只提供可选的 `IntervalPort`，本机演示没有逐处归属来源。
 
 ## 总览
 
@@ -101,7 +105,7 @@ new Intl.Segmenter(undefined, { granularity: 'word' })
 
 ### 5.1 数据来源
 
-服务端在解码 Yjs state 时与 canonical content **同一次解码**产出归属区间。同源是坐标正确的唯一保证：分两次解码在 canonicalize 版本升级后会得到不同结果，区间就静默错位到别人名下。
+若宿主服务提供逐处归属，应在解码 Yjs state 时与 canonical content **同一次解码**产出归属区间。同源是坐标正确的前提：分两次解码在 canonicalize 版本升级后可能得到不同结果，区间就会错位。公开后端通过可选 `IntervalPort` 接收该区间，不负责提取真实用户身份。
 
 区间以 canonical 文档的 ProseMirror 坐标表达。注意 **ProseMirror 的叶子节点占 1 位**（`nodeSize = isLeaf ? 1 : 2 + content.size`）：早期实现给每个 Yjs `XmlElement` 都算开闭各 1 位，导致图片、提及、分割线、shift-Enter 换行等每出现一次就让后续区间 +1 且误差累积，最终 `textBetween` 越界抛出。
 
@@ -113,7 +117,7 @@ new Intl.Segmenter(undefined, { granularity: 'word' })
 null                                                 无归属 → 不署名、走中性色
 ```
 
-`ranges` 是**区间量**：只声明「从上一版到这一版之间，新增了哪些位置、是谁写的」，不描述「此刻每个幸存字符是谁写的」。服务端拿上一条修订的 Yjs 状态向量作基线，只声明 `clock` 在基线之后的 item（跨基线的 item 按 clock 切开 —— Yjs 会合并同一 client 连续相邻的 item，不切开会让「接着上一版末尾往下写」整段丢归属）。
+`ranges` 是**区间量**：只声明「从上一版到这一版之间，新增了哪些位置、是谁写的」，不描述「此刻每个幸存字符是谁写的」。若宿主采用源系统的提取方式，应拿上一条修订的 Yjs 状态向量作基线，只声明 `clock` 在基线之后的 item（跨基线的 item 按 clock 切开 —— Yjs 会合并同一 client 连续相邻的 item，不切开会让「接着上一版末尾往下写」整段丢归属）。
 
 这与列表侧的 `collaborators` 因此是同一量纲，两者刻意配套：一个说「这个区间改了哪些位置」，一个说「谁改的」。归属的唯一消费者是 diff 徽章，而徽章要回答「**这一处改动**是谁做的」—— 累计量答的是另一个问题，后果见 5.3。
 
