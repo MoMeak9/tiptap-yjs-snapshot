@@ -26,4 +26,25 @@ describe('revision API', () => {
 
     await expect(api.restore('demo', 'r1')).rejects.toThrow('Cannot restore this revision')
   })
+
+  it('reads the V2 virtual current revision through the detail route', async () => {
+    const fetcher = vi.fn(async (_input: RequestInfo | URL) => new Response(JSON.stringify({
+      code: 0,
+      data: {
+        id: 'current-my doc', version: -1, type: 'current', ctime: 1790553600000,
+        availability: 'ready', diffEligible: true, restorable: false,
+        content: { type: 'doc', content: [] }, contentHash: 'current-hash',
+      },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    const api = createRevisionApi(fetcher as typeof fetch)
+
+    const result = await api.current('my doc')
+
+    expect(result.id).toBe('current-my doc')
+    expect(result.restorable).toBe(false)
+    const url = new URL(String(fetcher.mock.calls[0][0]), 'http://localhost')
+    expect(url.pathname).toBe('/api/revisions/detail')
+    expect(url.searchParams.get('doc_id')).toBe('my doc')
+    expect(url.searchParams.get('id')).toBe('current-my doc')
+  })
 })

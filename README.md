@@ -1,6 +1,6 @@
-# Tiptap × Yjs 快照参考实现
+# Tiptap × Yjs V2 修订历史参考实现
 
-一个可在本机运行的前后端示例：实时编辑 Tiptap 文档，创建和查看历史版本，并从完整 Yjs V2 状态恢复。代码为独立编写的参考实现，使用公开依赖，不包含业务系统源码。
+一个可在本机运行的前后端示例，提取 V2 修订历史的数据与交互契约：持久化完整 Yjs V2 状态及同源 JSON、自动和手动建版、历史预览与差异、恢复后重建协同文档。代码为独立编写的参考实现，使用公开依赖，不包含业务系统源码。
 
 ![实时文档与独立历史预览](docs/demo.jpg)
 
@@ -13,7 +13,7 @@ npm install
 npm run dev
 ```
 
-打开 <http://127.0.0.1:5173>。服务端监听 `127.0.0.1:3001`，Vite 将 API 和 WebSocket 请求代理过去。可以打开两个浏览器窗口观察同步。依次编辑正文、保存命名版本、选择历史版本预览，再尝试恢复。运行数据保存在本地 `.data/`，已加入 `.gitignore`。
+打开 <http://127.0.0.1:5173>。服务端监听 `127.0.0.1:3001`，Vite 将 API 和 WebSocket 请求代理过去。可以打开两个浏览器窗口观察同步。编辑后等待自动修订出现，也可以通过单独的手动创建控件保存命名版本；选择版本查看只读预览与差异，再尝试恢复。运行数据保存在本地 `.data/`，已加入 `.gitignore`。
 
 ```bash
 npm test
@@ -39,7 +39,7 @@ flowchart LR
 - 恢复先保存恢复前版本，再替换当前状态，并关闭旧 WebSocket 连接。客户端重建 Y.Doc，防止旧 CRDT 内容重新合并。
 - 历史预览使用单独的只读编辑器实例，不会调用实时编辑器的 `setContent`。
 
-完整流程见 [前后端方案](docs/architecture.zh-CN.md)，接口与兼容边界见 [快照契约](docs/contract.zh-CN.md)。
+先读 [V2 提取范围与适配差异](docs/v2-extraction.zh-CN.md)；完整流程见 [前后端方案](docs/architecture.zh-CN.md)，接口与兼容边界见 [快照契约](docs/contract.zh-CN.md)。
 
 ## 目录
 
@@ -49,6 +49,7 @@ flowchart LR
 | `src/client/` | 实时编辑器、修订列表、只读预览与恢复交互 |
 | `docs/contract.zh-CN.md` | 数据、接口、恢复和兼容性契约 |
 | `docs/architecture.zh-CN.md` | 前后端写入、预览与恢复流程 |
+| `docs/v2-extraction.zh-CN.md` | V2 合同与本地示例的适配边界 |
 
 ## 生产接入
 

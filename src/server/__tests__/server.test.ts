@@ -1,7 +1,8 @@
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { TiptapTransformer } from '@hocuspocus/transformer'
 import StarterKit from '@tiptap/starter-kit'
 import WebSocket from 'ws'
@@ -76,6 +77,228 @@ function sendUpdate(ws: WebSocket, epoch: number, doc: Y.Doc) {
 }
 
 describe('snapshot reference server', () => {
+  it('does not create an auto revision when an untouched client disconnects', async () => {
+    const { server, base, dataDir } = await fixture(20)
+    const { ws } = await openSocket(server.port, 'untouched')
+    ws.close()
+    await new Promise(resolve => ws.once('close', resolve))
+    await new Promise(resolve => setTimeout(resolve, 50))
+    const list = await api(base, '/api/revisions/list?doc_id=untouched')
+    expect(list.body.data.data).toEqual([])
+    expect(await readdir(dataDir)).toEqual([])
+  })
+
+  it('increments revisionCount only for semantic document changes, including restore', async () => {
+    const { server, base, dataDir } = await fixture(60_000)
+    const { ws, sync } = await openSocket(server.port, 'counted')
+    const source = ydoc('Body', 'First')
+    sendUpdate(ws, sync.epoch, source)
+    await eventually(() => api(base, '/api/revisions/detail?doc_id=counted&id=current-counted'),
+      result => result.body.data?.title === 'First')
+    const file = join(dataDir, (await readdir(dataDir))[0])
+    const stored = async () => JSON.parse(await readFile(file, 'utf8'))
+    expect((await stored()).revisionCount).toBe(1)
+
+    const peer = await openSocket(server.port, 'counted')
+    const broadcast = new Promise(resolve => peer.ws.once('message', resolve))
+    sendUpdate(ws, sync.epoch, source)
+    await broadcast
+    expect((await stored()).revisionCount).toBe(1)
+    const saved = await api(base, '/api/revisions/create?doc_id=counted', { method: 'POST', body: '{}' })
+    expect((await stored()).revisionCount).toBe(1)
+
+    source.getText('title').delete(0, source.getText('title').length)
+    source.getText('title').insert(0, 'Second')
+    sendUpdate(ws, sync.epoch, source)
+    await eventually(() => api(base, '/api/revisions/detail?doc_id=counted&id=current-counted'),
+      result => result.body.data?.title === 'Second')
+    expect((await stored()).revisionCount).toBe(2)
+    await api(base, '/api/revisions/restore?doc_id=counted', {
+      method: 'POST', body: JSON.stringify({ id: saved.body.data.id }),
+    })
+    expect((await stored()).revisionCount).toBe(3)
+    await api(base, '/api/revisions/restore?doc_id=counted', {
+      method: 'POST', body: JSON.stringify({ id: saved.body.data.id }),
+    })
+    expect((await stored()).revisionCount).toBe(3)
+    peer.ws.close()
+  })
+
+  it('retries a failed last-client materialization while the durable pending task remains', async () => {
+    const { server, base, dataDir } = await fixture(60_000)
+    const { ws, sync } = await openSocket(server.port, 'retry')
+    sendUpdate(ws, sync.epoch, ydoc('Retry me', 'Retry title'))
+    await eventually(() => api(base, '/api/revisions/detail?doc_id=retry&id=current-retry'),
+      result => result.body.data?.title === 'Retry title')
+
+    const file = join(dataDir, (await readdir(dataDir))[0])
+    const backup = `${file}.bak`
+    await rename(file, backup)
+    await mkdir(file)
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      ws.close()
+      await new Promise(resolve => ws.once('close', resolve))
+      await eventually(async () => errors.mock.calls.some(call =>
+        String(call[0]).includes('Disconnect revision failed')), value => value)
+      expect(JSON.parse(await readFile(backup, 'utf8')).pendingAutoAt).toEqual(expect.any(Number))
+      await rm(file, { recursive: true })
+      await rename(backup, file)
+      await eventually(() => api(base, '/api/revisions/list?doc_id=retry'),
+        result => result.body.data?.data?.length === 1)
+      expect(JSON.parse(await readFile(file, 'utf8')).pendingAutoAt).toBeNull()
+    } finally {
+      errors.mockRestore()
+      if ((await readdir(dataDir)).some(name => name.endsWith('.bak'))) {
+        await rm(file, { recursive: true, force: true })
+        await rename(backup, file)
+      }
+    }
+  })
+
+  it('persists current V2 fields and a recoverable delayed revision task before auto materialization', async () => {
+    const { server, base, dataDir } = await fixture(60_000)
+    const { ws, sync } = await openSocket(server.port, 'v2-durable')
+    sendUpdate(ws, sync.epoch, ydoc('Durable body', 'Durable title'))
+    await eventually(() => api(base, '/api/revisions/detail?doc_id=v2-durable&id=current-v2-durable'),
+      result => result.body.data?.title === 'Durable title')
+
+    const files = await readdir(dataDir)
+    expect(files).toHaveLength(1)
+    const stored = JSON.parse(await readFile(join(dataDir, files[0]), 'utf8'))
+    expect(stored).toMatchObject({
+      fileVersion: 2,
+      schemaVersion: 1,
+      title: 'Durable title',
+      content: { type: 'doc' },
+      contentHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      pendingAutoAt: expect.any(Number),
+    })
+    const virtual = await api(base, '/api/revisions/detail?doc_id=v2-durable&id=current-v2-durable')
+    expect(virtual.body.data).toMatchObject({
+      id: 'current-v2-durable', version: -1, type: 'current',
+      availability: 'ready', diffEligible: true, restorable: false,
+      decodedFromState: false,
+    })
+    expect((await api(base, '/api/revisions/detail?doc_id=v2-durable&id=current-other')).status).toBe(404)
+    ws.close()
+    await new Promise(resolve => ws.once('close', resolve))
+    await eventually(() => api(base, '/api/revisions/list?doc_id=v2-durable'),
+      result => result.body.data?.data?.length === 1)
+    const revised = JSON.parse(await readFile(join(dataDir, files[0]), 'utf8'))
+    expect(revised.pendingAutoAt).toBeNull()
+    expect(revised.revisions[0]).toMatchObject({
+      sourceFormat: 'v2_json', schemaVersion: 1, title: 'Durable title',
+      content: stored.content, contentHash: stored.contentHash,
+    })
+  })
+
+  it('recovers a pending delayed task after restart and uses V2 cursor and list metadata', async () => {
+    const { server, base, dataDir } = await fixture(200)
+    const { ws, sync } = await openSocket(server.port, 'recover')
+    sendUpdate(ws, sync.epoch, ydoc('Recover me', 'Recover'))
+    await eventually(() => api(base, '/api/revisions/detail?doc_id=recover&id=current-recover'),
+      result => result.body.data?.title === 'Recover')
+    await server.close()
+    servers.splice(servers.indexOf(server), 1)
+    ws.terminate()
+
+    const restarted = await startSnapshotServer({ host: '127.0.0.1', port: 0, dataDir, autoSnapshotIdleMs: 200 })
+    servers.push(restarted)
+    const restartedBase = `http://127.0.0.1:${restarted.port}`
+    const page = await eventually(() => api(restartedBase, '/api/revisions/list?doc_id=recover'),
+      result => result.body.data?.data?.length === 1)
+    expect(page.body.data.data[0]).toMatchObject({
+      availability: 'ready', diffEligible: true, restorable: true,
+      ctime: expect.any(Number), restoredFromVersion: null,
+    })
+    const manual = await api(restartedBase, '/api/revisions/create?doc_id=recover', { method: 'POST', body: '{}' })
+    const first = await api(restartedBase, '/api/revisions/list?doc_id=recover&limit=1')
+    expect(first.body.data.nextCursor).toBe(Buffer.from(`v2:${manual.body.data.version}:${manual.body.data.id}`).toString('base64url'))
+    const second = await api(restartedBase, `/api/revisions/list?doc_id=recover&limit=1&cursor=${first.body.data.nextCursor}`)
+    expect(second.body.data.data).toHaveLength(1)
+    expect((await api(restartedBase, '/api/revisions/list?doc_id=recover&cursor=MQ')).status).toBe(400)
+  })
+
+  it('writes restore audit metadata and only backs up a changed current document', async () => {
+    const { server, base, dataDir } = await fixture(60_000)
+    const { ws, sync } = await openSocket(server.port, 'audit')
+    const source = ydoc('A', 'First')
+    sendUpdate(ws, sync.epoch, source)
+    await eventually(() => api(base, '/api/revisions/detail?doc_id=audit&id=current-audit'), r => r.body.data?.title === 'First')
+    const saved = await api(base, '/api/revisions/create?doc_id=audit', { method: 'POST', body: '{}' })
+    source.getText('title').delete(0, source.getText('title').length)
+    source.getText('title').insert(0, 'Second')
+    const body = source.getXmlFragment('default')
+    body.delete(0, body.length)
+    const changed = ydoc('B', 'Second').getXmlFragment('default').toArray()
+      .filter((node): node is Y.XmlElement | Y.XmlText => node instanceof Y.XmlElement || node instanceof Y.XmlText)
+      .map(node => node.clone())
+    body.insert(0, changed)
+    sendUpdate(ws, sync.epoch, source)
+    await eventually(() => api(base, '/api/revisions/detail?doc_id=audit&id=current-audit'), r => r.body.data?.title === 'Second')
+    const restore = await api(base, '/api/revisions/restore?doc_id=audit', {
+      method: 'POST', body: JSON.stringify({ id: saved.body.data.id }),
+    })
+    expect(restore.body.data).toEqual({ id: saved.body.data.id })
+    const list = await api(base, '/api/revisions/list?doc_id=audit')
+    expect(list.body.data.data.map((r: { type: string }) => r.type)).toEqual(['restore', 'pre_restore', 'manual'])
+    expect(list.body.data.data[0].restoredFromVersion).toBe(saved.body.data.version)
+    const detail = await api(base, `/api/revisions/detail?doc_id=audit&id=${list.body.data.data[0].id}`)
+    expect(detail.body.data).toMatchObject({ content: { type: 'doc' }, decodedFromState: false })
+    const files = await readdir(dataDir)
+    const stored = JSON.parse(await readFile(join(dataDir, files[0]), 'utf8'))
+    expect(stored.revisions.at(-1).restoredFromSnapshotId).toBe(saved.body.data.id)
+    expect(stored.revisions.at(-1).state).toBe(stored.revisions[0].state)
+
+    const same = await api(base, '/api/revisions/restore?doc_id=audit', {
+      method: 'POST', body: JSON.stringify({ id: saved.body.data.id }),
+    })
+    expect(same.body.data).toEqual({ id: saved.body.data.id })
+    const repeated = await api(base, '/api/revisions/list?doc_id=audit')
+    expect(repeated.body.data.data.filter((r: { type: string }) => r.type === 'pre_restore')).toHaveLength(1)
+    expect(repeated.body.data.data.filter((r: { type: string }) => r.type === 'restore')).toHaveLength(2)
+  })
+
+  it('reads a legacy V1 revision through bounded lazy V2 state decoding', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'snapshot-legacy-'))
+    directories.push(dataDir)
+    const doc = ydoc('Old body', 'Old title')
+    const id = 'legacy'
+    const revisionId = '11111111-1111-1111-1111-111111111111'
+    const invalidId = '22222222-2222-2222-2222-222222222222'
+    const state = Buffer.from(Y.encodeStateAsUpdateV2(doc)).toString('base64')
+    const path = join(dataDir, `${createHash('sha256').update(id).digest('hex')}.json`)
+    await writeFile(path, JSON.stringify({
+      schemaVersion: 1, documentId: id, epoch: 1, updatedAt: new Date().toISOString(),
+      state, revisions: [{ id: revisionId, documentId: id, version: 1, type: 'manual', name: null,
+        ctime: Date.now(), createdAt: new Date().toISOString(), title: 'Old title', contentHash: '', state },
+      { id: invalidId, documentId: id, version: 2, type: 'manual', name: null,
+        ctime: Date.now(), createdAt: new Date().toISOString(), title: 'Broken', contentHash: '', state: 'AAAA' }],
+    }))
+    const server = await startSnapshotServer({ host: '127.0.0.1', port: 0, dataDir })
+    servers.push(server)
+    const base = `http://127.0.0.1:${server.port}`
+    const before = await api(base, '/api/revisions/list?doc_id=legacy')
+    expect(before.body.data.data.find((r: { id: string }) => r.id === revisionId))
+      .toMatchObject({ availability: 'legacy_pending', diffEligible: false, restorable: true })
+    const detail = await api(base, `/api/revisions/detail?doc_id=legacy&id=${revisionId}`)
+    expect(detail.body.data).toMatchObject({ availability: 'ready', decodedFromState: true,
+      content: { type: 'doc' }, contentHash: expect.stringMatching(/^[a-f0-9]{64}$/) })
+    const invalid = await api(base, `/api/revisions/detail?doc_id=legacy&id=${invalidId}`)
+    expect(invalid.body.data).toMatchObject({ availability: 'legacy_failed', diffEligible: false,
+      content: null, contentHash: null, restorable: false })
+    expect((await api(base, '/api/revisions/restore?doc_id=legacy', {
+      method: 'POST', body: JSON.stringify({ id: invalidId }),
+    })).status).toBe(400)
+    expect((await api(base, '/api/revisions/list?doc_id=legacy')).body.data.data
+      .find((r: { id: string }) => r.id === invalidId).restorable).toBe(false)
+    const migrated = JSON.parse(await readFile(path, 'utf8'))
+    expect(migrated.revisionCount).toBe(0)
+    expect(migrated.revisions[0].content).toEqual(detail.body.data.content)
+    expect(migrated.revisions[1].migrationStatus).toBe('failed')
+  })
+
   it('persists a V2 collaboration update and creates only one idle revision for identical semantic content', async () => {
     const { server, base, dataDir } = await fixture(35)
     const { ws, sync } = await openSocket(server.port, 'alpha')

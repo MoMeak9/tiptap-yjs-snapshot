@@ -74,6 +74,13 @@ button:focus-visible, input:focus-visible, .tiptap:focus-visible { outline: 3px 
 .editor-hint { font-size: 11px; color: #9aa6b8; margin: 9px 0 0; }
 .save-card { padding: 23px 27px 25px; }
 .save-card p:last-child { color: #8b97a8; font-size: 11px; line-height: 1.6; margin: 8px 0 0; }
+.manual-example { min-height: 0; }
+.manual-example summary { color: #596881; font-size: 12px; font-weight: 700; cursor: pointer; }
+.manual-example summary:focus-visible { outline: 3px solid #95b3fa; outline-offset: 3px; }
+.history-entry { min-height: 335px; padding: 30px; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; }
+.history-entry h2 { margin: 0; font-size: 19px; }
+.history-entry p:not(.eyebrow) { color: #7d899c; font-size: 12px; line-height: 1.7; max-width: 330px; }
+.history-entry .primary-button { margin-top: 12px; }
 .save-controls { display: flex; gap: 9px; margin-top: 20px; }
 .save-controls input { flex: 1; min-width: 0; border: 1px solid #e4e9f1; border-radius: 9px; background: #fbfcfe; padding: 10px 12px; font-size: 12px; }
 .primary-button { border: 1px solid #3f5dbb; background: #3f5dbb; border-radius: 9px; color: #fff; font-weight: 700; font-size: 12px; padding: 10px 17px; white-space: nowrap; box-shadow: 0 4px 11px #3f5dbb30; }
@@ -94,6 +101,8 @@ button:focus-visible, input:focus-visible, .tiptap:focus-visible { outline: 3px 
 .revision-text { flex: 1; min-width: 0; }
 .revision-text strong { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #35445c; font-size: 11px; }
 .revision-text small { color: #a1adbd; font-size: 9px; white-space: nowrap; }
+.revision-text small + small { display: block; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; }
+.revision-text .availability-note { color: #a55d48; }
 .revision-chevron { color: #a6b2c5; font-size: 18px; }
 .load-more { width: calc(100% - 14px); border: 1px solid #e3e9f2; background: #fff; color: #6077bb; border-radius: 8px; margin: 13px 7px 0; padding: 8px; font-size: 11px; }
 .load-more:hover:not(:disabled) { background: #f5f7fd; }
@@ -123,6 +132,14 @@ button:focus-visible, input:focus-visible, .tiptap:focus-visible { outline: 3px 
 .compare-meta .same { color: #348469; background: #edf9f4; }
 .compare-meta .different { color: #9b6b2c; background: #fff7e9; }
 .compare-meta button { border: 0; background: none; color: #5874bb; font-size: 10px; }
+.compare-controls { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 16px; }
+.compare-controls button { border: 1px solid #e2e8f2; background: #fff; color: #718096; padding: 7px 10px; font-size: 10px; border-radius: 7px; }
+.compare-controls button.active { border-color: #c7d5f7; background: #eff3ff; color: #4361b6; font-weight: 700; }
+.change-list { display: grid; gap: 6px; max-height: 205px; overflow: auto; padding: 0; margin: 12px 0 4px; list-style: none; }
+.change-list li { border: 1px solid #edf0f5; border-radius: 6px; padding: 8px 9px; color: #445269; background: #fafbfe; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.change-list .change-insert { background: #f0fbf5; border-color: #d8f1e2; }
+.change-list .change-delete { background: #fff5f5; border-color: #f8dede; }
+.change-list .change-format, .change-list .change-block { background: #f5f4ff; border-color: #e6e3f8; }
 .compare-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .compare-grid h4 { margin: 16px 0 0; font-size: 10px; color: #6b7a90; }
 .compare-grid .preview-document { margin-top: 7px; }

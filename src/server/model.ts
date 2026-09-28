@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto'
 import { TiptapTransformer } from '@hocuspocus/transformer'
+import { getSchema } from '@tiptap/core'
+import StarterKit from '@tiptap/starter-kit'
 import type * as Y from 'yjs'
 
 export type Materialized = {
@@ -7,6 +9,10 @@ export type Materialized = {
   content: Record<string, unknown>
   hash: string
 }
+
+/** This portable sample supports the built-in StarterKit document schema only. */
+export const CONTENT_SCHEMA_VERSION = 1
+const schema = getSchema([StarterKit])
 
 // Yjs encodings contain client clocks and insertion history; revisions compare the
 // materialized editor document instead of bytes so equivalent edits deduplicate.
@@ -20,7 +26,10 @@ function canonical(value: unknown): string {
 }
 
 export function materialize(doc: Y.Doc): Materialized {
-  const content = TiptapTransformer.fromYdoc(doc, 'default') as Record<string, unknown>
+  // Round-trip through the same schema on every write (and legacy decode), so
+  // state-derived JSON and the stored semantic hash use the same defaults.
+  const extracted = TiptapTransformer.fromYdoc(doc, 'default') as Record<string, unknown>
+  const content = schema.nodeFromJSON(extracted).toJSON() as Record<string, unknown>
   return {
     title: doc.getText('title').toString(),
     content,

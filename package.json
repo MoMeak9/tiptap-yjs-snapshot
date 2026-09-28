@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A runnable Tiptap and Yjs revision history reference",
+  "description": "A runnable V2 revision history reference for Tiptap and Yjs",
   "engines": {
     "node": ">=22.13.0"
   },

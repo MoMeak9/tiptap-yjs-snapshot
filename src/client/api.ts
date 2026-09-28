@@ -1,26 +1,36 @@
 import type { JSONContent } from '@tiptap/core'
 
+export interface RevisionContributor {
+  username: string
+  nickname: string
+}
+
 export interface RevisionSummary {
   id: string
+  documentId: string
   version: number
-  name?: string | null
-  createdAt?: string
-  ctime?: string | number
-  title?: string
-  contentHash?: string
+  name: string | null
+  title: string
+  type: 'auto' | 'manual' | 'pre_restore' | 'restore' | 'current'
+  ctime: number
+  createdBy: string | null
+  createdByUser: RevisionContributor | null
+  collaborators: RevisionContributor[]
+  availability: 'ready' | 'legacy_pending' | 'legacy_failed' | 'deleted'
+  diffEligible: boolean
+  restorable: boolean
+  restoredFromVersion: number | null
 }
 
-export interface RevisionDetail extends RevisionSummary {
-  title: string
-  content: JSONContent
-  contentHash: string
+export interface RevisionDetail extends Omit<RevisionSummary, 'collaborators'> {
+  collaborators: string[]
+  content: JSONContent | null
+  contentHash: string | null
+  decodedFromState: boolean
+  attribution: null
 }
 
-export interface CurrentDocument {
-  title: string
-  content: JSONContent
-  contentHash: string
-}
+export type CurrentDocument = RevisionDetail
 
 export interface RevisionPage {
   data: RevisionSummary[]
@@ -79,7 +89,7 @@ export function createRevisionApi(fetcher: typeof fetch = fetch) {
     detail: (docId: string, id: string, signal?: AbortSignal) =>
       request<RevisionDetail>(`detail?${query(docId, { id })}`, { signal }),
     current: (docId: string, signal?: AbortSignal) =>
-      request<CurrentDocument>(`current?${query(docId)}`, { signal }),
+      request<CurrentDocument>(`detail?${query(docId, { id: `current-${docId}` })}`, { signal }),
     create: (docId: string, name?: string, signal?: AbortSignal) =>
       post<{ id: string; version: number }>(`create?${query(docId)}`, name ? { name } : {}, signal),
     restore: (docId: string, id: string, signal?: AbortSignal) =>

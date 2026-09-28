@@ -1,12 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
+import { mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { WebSocket, WebSocketServer } from 'ws'
 import * as Y from 'yjs'
-import { materialize, type Materialized } from './model'
+import { CONTENT_SCHEMA_VERSION, materialize, type Materialized } from './model'
 
-type RevisionType = 'manual' | 'auto' | 'pre_restore'
+type RevisionType = 'manual' | 'auto' | 'pre_restore' | 'restore'
 
 type Revision = {
   id: string
@@ -18,15 +18,30 @@ type Revision = {
   createdAt: string
   title: string
   contentHash: string
-  state: string
+  content: Record<string, unknown> | null
+  schemaVersion: number
+  sourceFormat: 'v2_json' | 'yjs_v2'
+  state: string | null
+  restoredFromSnapshotId: string | null
+  migrationStatus?: 'failed'
 }
 
 type StoredDocument = {
-  schemaVersion: 1
+  /** Version of this local file adapter, separate from the editor schema. */
+  fileVersion: 2
+  schemaVersion: number
+  sourceFormat: 'v2_json'
   documentId: string
   epoch: number
   updatedAt: string
   state: string
+  title: string
+  content: Record<string, unknown>
+  contentHash: string
+  /** Counts semantic title/body writes, independent of history row count. */
+  revisionCount: number
+  /** Durable delayed job. A restart can resume it without a process-local timer. */
+  pendingAutoAt: number | null
   revisions: Revision[]
 }
 
@@ -57,6 +72,7 @@ class HttpError extends Error {
 
 const BAD_REQUEST = 400
 const NOT_FOUND = 404
+const MAX_LEGACY_DECODE_BYTES = 8 * 1024 * 1024
 
 function documentId(url: URL): string {
   const value = url.searchParams.get('doc_id') ?? 'demo'
@@ -89,35 +105,58 @@ function clone(doc: Y.Doc): Y.Doc {
   return copy
 }
 
-function revisionOf(stored: StoredDocument, type: RevisionType, name: string | null, value: Materialized): Revision {
-  const ctime = Date.now()
+function revisionOf(stored: StoredDocument, type: RevisionType, name: string | null,
+  restoredFromSnapshotId: string | null = null): Revision {
+  const ctime = Math.max(Date.now(), (stored.revisions.at(-1)?.ctime ?? 0) + 1)
+  const lastVersion = stored.revisions.reduce((maximum, item) => Math.max(maximum, item.version), -1)
   return {
     id: randomUUID(),
     documentId: stored.documentId,
-    version: (stored.revisions.at(-1)?.version ?? 0) + 1,
+    version: lastVersion + 1,
     type,
     name,
     ctime,
     createdAt: new Date(ctime).toISOString(),
-    title: value.title,
-    contentHash: value.hash,
+    title: stored.title,
+    contentHash: stored.contentHash,
+    content: stored.content,
+    schemaVersion: stored.schemaVersion,
+    sourceFormat: 'v2_json',
     state: stored.state,
+    restoredFromSnapshotId,
   }
 }
 
-function summary(revision: Revision) {
-  const { state: _state, ...fields } = revision
-  return fields
+function availability(revision: Revision): 'ready' | 'legacy_pending' | 'legacy_failed' {
+  if (revision.content !== null) return 'ready'
+  return revision.migrationStatus === 'failed' ? 'legacy_failed' : 'legacy_pending'
 }
 
-function cursorVersion(raw: string | null): number | null {
+function summary(revision: Revision, revisions: Revision[]) {
+  const { state: _state, content: _content, createdAt: _createdAt,
+    schemaVersion: _schemaVersion,
+    sourceFormat: _sourceFormat, migrationStatus: _migrationStatus,
+    restoredFromSnapshotId: _restoredFromSnapshotId, ...fields } = revision
+  const status = availability(revision)
+  return { ...fields, createdBy: null, createdByUser: null, collaborators: [],
+    availability: status, diffEligible: status === 'ready',
+    // This StarterKit-only file adapter cannot restore a state it already
+    // failed to decode. Production can make a different capability decision.
+    restorable: Boolean(revision.state) && revision.migrationStatus !== 'failed',
+    restoredFromVersion: revision.restoredFromSnapshotId === null ? null
+      : revisions.find(item => item.id === revision.restoredFromSnapshotId)?.version ?? null }
+}
+
+function cursorKey(raw: string | null): { version: number; id: string } | null {
   if (raw === null) return null
   try {
-    const text = Buffer.from(raw, 'base64url').toString('utf8')
-    if (!/^[1-9]\d*$/.test(text)) throw new Error('bad cursor')
-    const value = Number(text)
-    if (!Number.isSafeInteger(value)) throw new Error('bad cursor')
-    return value
+    const decoded = Buffer.from(raw, 'base64url')
+    if (decoded.toString('base64url') !== raw || decoded.length > 80) throw new Error('bad cursor')
+    const match = /^v2:(0|[1-9]\d*):([0-9a-f-]{36})$/.exec(decoded.toString('utf8'))
+    if (!match) throw new Error('bad cursor')
+    const version = Number(match[1])
+    if (!Number.isSafeInteger(version)) throw new Error('bad cursor')
+    return { version, id: match[2] }
   } catch {
     throw new HttpError(BAD_REQUEST, 'Invalid cursor')
   }
@@ -192,20 +231,66 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
     const loading = (async () => {
       let stored: StoredDocument
       try {
-        stored = JSON.parse(await readFile(pathFor(id), 'utf8')) as StoredDocument
-        if (stored.schemaVersion !== 1 || stored.documentId !== id || !Array.isArray(stored.revisions) ||
-            typeof stored.state !== 'string' || !Number.isSafeInteger(stored.epoch)) {
+        const raw = JSON.parse(await readFile(pathFor(id), 'utf8')) as Record<string, unknown>
+        if (raw.documentId !== id || !Array.isArray(raw.revisions) ||
+            typeof raw.state !== 'string' || !Number.isSafeInteger(raw.epoch)) {
+          throw new Error('Unsupported or corrupt document file')
+        }
+        if (raw.fileVersion === 2 && raw.schemaVersion === CONTENT_SCHEMA_VERSION &&
+            raw.sourceFormat === 'v2_json' && typeof raw.title === 'string' &&
+            typeof raw.contentHash === 'string' && raw.content && typeof raw.content === 'object' &&
+            (raw.revisionCount === undefined ||
+              (Number.isSafeInteger(raw.revisionCount) && (raw.revisionCount as number) >= 0)) &&
+            (raw.pendingAutoAt === null || typeof raw.pendingAutoAt === 'number')) {
+          // Earlier V2 sample files had no counter; migrate them lazily on the
+          // next write without guessing the number of past semantic edits.
+          stored = { ...raw, revisionCount: (raw.revisionCount as number | undefined) ?? 0 } as StoredDocument
+        } else if (raw.schemaVersion === 1 && raw.fileVersion === undefined) {
+          // The first edition of this demo stored only V2 binary state. Reading it
+          // does not rewrite legacy revisions; detail can decode/backfill one at a time.
+          const previous = raw as { documentId: string; epoch: number; updatedAt: string;
+            state: string; revisions: Array<Partial<Revision> & { id: string; state?: string }> }
+          const currentDoc = new Y.Doc()
+          try {
+            Y.applyUpdateV2(currentDoc, decodeUpdate(previous.state))
+            const current = materialize(currentDoc)
+            stored = {
+              fileVersion: 2, schemaVersion: CONTENT_SCHEMA_VERSION, sourceFormat: 'v2_json',
+              documentId: id, epoch: previous.epoch, updatedAt: previous.updatedAt,
+              state: previous.state, title: current.title, content: current.content,
+              contentHash: current.hash, revisionCount: 0, pendingAutoAt: null,
+              revisions: previous.revisions.map(item => ({
+                id: item.id, documentId: id, version: item.version ?? 0,
+                type: item.type ?? 'manual', name: item.name ?? null,
+                ctime: item.ctime ?? 0, createdAt: item.createdAt ?? new Date(0).toISOString(),
+                title: item.title ?? '', contentHash: item.contentHash ?? '',
+                content: null, schemaVersion: CONTENT_SCHEMA_VERSION, sourceFormat: 'yjs_v2',
+                state: item.state ?? null, restoredFromSnapshotId: null,
+              })),
+            }
+          } finally {
+            currentDoc.destroy()
+          }
+        } else {
           throw new Error('Unsupported or corrupt document file')
         }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
         const doc = new Y.Doc()
+        const current = materialize(doc)
         stored = {
-          schemaVersion: 1,
+          fileVersion: 2,
+          schemaVersion: CONTENT_SCHEMA_VERSION,
+          sourceFormat: 'v2_json',
           documentId: id,
           epoch: 1,
           updatedAt: new Date().toISOString(),
           state: encode(doc),
+          title: current.title,
+          content: current.content,
+          contentHash: current.hash,
+          revisionCount: 0,
+          pendingAutoAt: null,
           revisions: [],
         }
         return { doc, stored, clients: new Set<WebSocket>() }
@@ -229,22 +314,63 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
     return result
   }
 
+  async function materializeAuto(room: Room): Promise<void> {
+    const latest = [...room.stored.revisions]
+      .sort((a, b) => b.version - a.version || b.id.localeCompare(a.id))[0]
+    if (latest?.contentHash === room.stored.contentHash && latest.title === room.stored.title) {
+      if (room.stored.pendingAutoAt !== null) {
+        const next = { ...room.stored, pendingAutoAt: null }
+        await persist(next)
+        room.stored = next
+      }
+      return
+    }
+    const revision = revisionOf(room.stored, 'auto', null)
+    const next: StoredDocument = { ...room.stored, pendingAutoAt: null,
+      revisions: [...room.stored.revisions, revision] }
+    await persist(next)
+    room.stored = next
+  }
+
   function scheduleAuto(id: string, room: Room) {
+    if (stopped) return
+    if (room.autoTimer) clearTimeout(room.autoTimer)
+    if (room.stored.pendingAutoAt === null) return
+    room.autoTimer = setTimeout(() => {
+      room.autoTimer = undefined
+      void serialize(id, async () => {
+        if (stopped) return
+        if (room.stored.pendingAutoAt !== null && room.stored.pendingAutoAt <= Date.now()) {
+          await materializeAuto(room)
+        }
+      }).then(() => {
+        if (!stopped && room.stored.pendingAutoAt !== null) scheduleAuto(id, room)
+      }).catch(error => {
+        console.error('Automatic revision failed:', error)
+        if (!stopped) room.autoTimer = setTimeout(() => scheduleAuto(id, room), 1000)
+      })
+    }, Math.max(0, room.stored.pendingAutoAt - Date.now()))
+  }
+
+  function retryDisconnectAuto(id: string, room: Room, expectedPendingAt: number | null) {
     if (stopped) return
     if (room.autoTimer) clearTimeout(room.autoTimer)
     room.autoTimer = setTimeout(() => {
       room.autoTimer = undefined
       void serialize(id, async () => {
         if (stopped) return
-        const value = materialize(room.doc)
-        const latest = room.stored.revisions.at(-1)
-        if (latest?.contentHash === value.hash && latest.title === value.title) return
-        const revision = revisionOf(room.stored, 'auto', null, value)
-        const next = { ...room.stored, revisions: [...room.stored.revisions, revision] }
-        await persist(next)
-        room.stored = next
-      }).catch(error => console.error('Automatic revision failed:', error))
-    }, autoSnapshotIdleMs)
+        if (room.stored.pendingAutoAt !== expectedPendingAt) {
+          // A later edit superseded this disconnect. Its delayed task owns the
+          // new state and should keep its own deadline.
+          scheduleAuto(id, room)
+          return
+        }
+        await materializeAuto(room)
+      }).catch(error => {
+        console.error('Disconnect revision retry failed:', error)
+        retryDisconnectAuto(id, room, expectedPendingAt)
+      })
+    }, 1000)
   }
 
   async function handleHttp(request: IncomingMessage, response: ServerResponse) {
@@ -264,10 +390,11 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
       const room = await roomFor(id)
 
       if (request.method === 'GET' && url.pathname === '/api/revisions/current') {
+        // Sample transport compatibility only: V2 history uses detail?id=current-<docId>.
         const value = await serialize(id, async () => {
-          const current = materialize(room.doc)
-          return { documentId: id, title: current.title, content: current.content,
-            contentHash: current.hash, epoch: room.stored.epoch, updatedAt: room.stored.updatedAt }
+          return { documentId: id, title: room.stored.title, content: room.stored.content,
+            contentHash: room.stored.contentHash, epoch: room.stored.epoch,
+            updatedAt: room.stored.updatedAt }
         })
         return send(response, 200, { code: 0, data: value })
       }
@@ -276,15 +403,17 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
         const rawLimit = url.searchParams.get('limit')
         const limit = rawLimit === null ? 20 : Number(rawLimit)
         if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new HttpError(BAD_REQUEST, 'Invalid limit')
-        const cursor = cursorVersion(url.searchParams.get('cursor'))
+        const cursor = cursorKey(url.searchParams.get('cursor'))
         const page = await serialize(id, async () => {
-          const matching = [...room.stored.revisions].reverse()
-            .filter(revision => cursor === null || revision.version < cursor)
+          const matching = [...room.stored.revisions]
+            .sort((a, b) => b.version - a.version || b.id.localeCompare(a.id))
+            .filter(revision => cursor === null || revision.version < cursor.version ||
+              (revision.version === cursor.version && revision.id < cursor.id))
           const selected = matching.slice(0, limit)
           const hasMore = matching.length > selected.length
           return {
-            data: selected.map(summary),
-            nextCursor: hasMore ? Buffer.from(String(selected.at(-1)!.version)).toString('base64url') : null,
+            data: selected.map(revision => summary(revision, room.stored.revisions)),
+            nextCursor: hasMore ? Buffer.from(`v2:${selected.at(-1)!.version}:${selected.at(-1)!.id}`).toString('base64url') : null,
             hasMore,
           }
         })
@@ -292,19 +421,58 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
       }
 
       if (request.method === 'GET' && url.pathname === '/api/revisions/detail') {
-        const revisionId = requiredId(url.searchParams.get('id'))
+        const rawId = url.searchParams.get('id')
+        if (rawId?.startsWith('current-') && rawId !== `current-${id}`) {
+          throw new HttpError(NOT_FOUND, 'Revision not found')
+        }
+        const revisionId = rawId === `current-${id}` ? rawId : requiredId(rawId)
         const detail = await serialize(id, async () => {
+          if (revisionId === `current-${id}`) {
+            return {
+              id: revisionId, documentId: id, version: -1, name: null,
+              title: room.stored.title, createdBy: null, createdByUser: null,
+              type: 'current', collaborators: [], restoredFromVersion: null,
+              ctime: Date.parse(room.stored.updatedAt), availability: 'ready',
+              diffEligible: true, restorable: false, content: room.stored.content,
+              contentHash: room.stored.contentHash, decodedFromState: false,
+              attribution: null,
+            }
+          }
           const revision = room.stored.revisions.find(item => item.id === revisionId)
           if (!revision) throw new HttpError(NOT_FOUND, 'Revision not found')
-          const doc = new Y.Doc()
-          try {
-            Y.applyUpdateV2(doc, decodeUpdate(revision.state))
-            const value = materialize(doc)
-            return { ...summary(revision), title: value.title, content: value.content,
-              contentHash: value.hash }
-          } finally {
-            doc.destroy()
+          let decodedFromState = false
+          let resolved = revision
+          if (revision.content === null && revision.state !== null &&
+              availability(revision) !== 'legacy_failed') {
+            let content: Materialized | null = null
+            if (revision.state.length <= Math.ceil(MAX_LEGACY_DECODE_BYTES * 4 / 3) + 4 &&
+                Buffer.from(revision.state, 'base64').length <= MAX_LEGACY_DECODE_BYTES) {
+              const legacy = new Y.Doc()
+              try {
+                Y.applyUpdateV2(legacy, decodeUpdate(revision.state))
+                content = materialize(legacy)
+              } catch {
+                // Bad legacy data is an explicit unavailable state. File write
+                // errors below still propagate and leave the old row unchanged.
+              } finally {
+                legacy.destroy()
+              }
+            }
+            resolved = content === null
+              ? { ...revision, migrationStatus: 'failed' }
+              : { ...revision, content: content.content, contentHash: content.hash,
+                  schemaVersion: CONTENT_SCHEMA_VERSION }
+            const next: StoredDocument = { ...room.stored,
+              revisions: room.stored.revisions.map(item => item.id === revision.id ? resolved : item) }
+            await persist(next)
+            room.stored = next
+            decodedFromState = content !== null
           }
+          const status = availability(resolved)
+          return { ...summary(resolved, room.stored.revisions),
+            availability: status, diffEligible: status === 'ready',
+            content: resolved.content, contentHash: resolved.content === null ? null : resolved.contentHash,
+            decodedFromState, attribution: null }
         })
         return send(response, 200, { code: 0, data: detail })
       }
@@ -316,8 +484,7 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
           throw new HttpError(BAD_REQUEST, 'Invalid revision name')
         }
         const created = await serialize(id, async () => {
-          const value = materialize(room.doc)
-          const revision = revisionOf(room.stored, 'manual', name, value)
+          const revision = revisionOf(room.stored, 'manual', name)
           const next = { ...room.stored, revisions: [...room.stored.revisions, revision] }
           await persist(next)
           room.stored = next
@@ -332,33 +499,48 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
         const restored = await serialize(id, async () => {
           const target = room.stored.revisions.find(item => item.id === revisionId)
           if (!target) throw new HttpError(NOT_FOUND, 'Revision not found')
+          if (!target.state || target.migrationStatus === 'failed') {
+            throw new HttpError(BAD_REQUEST, 'Revision has no restorable state')
+          }
           const replacement = new Y.Doc()
+          let targetValue: Materialized
           try {
             Y.applyUpdateV2(replacement, decodeUpdate(target.state))
-            materialize(replacement)
-          } catch (error) {
+            targetValue = materialize(replacement)
+          } catch {
             replacement.destroy()
-            throw error
+            if (target.sourceFormat === 'yjs_v2') {
+              const unavailable: Revision = { ...target, migrationStatus: 'failed' }
+              const next: StoredDocument = { ...room.stored,
+                revisions: room.stored.revisions.map(item => item.id === target.id ? unavailable : item) }
+              await persist(next)
+              room.stored = next
+            }
+            throw new HttpError(BAD_REQUEST, 'Revision state cannot be restored')
           }
 
-          // This first atomic write must succeed before the current document is replaced.
-          const before = materialize(room.doc)
-          const backup = revisionOf(room.stored, 'pre_restore', null, before)
-          const withBackup = { ...room.stored, revisions: [...room.stored.revisions, backup] }
-          try {
-            await persist(withBackup)
-          } catch (error) {
-            replacement.destroy()
-            throw error
-          }
-          room.stored = withBackup
-
-          const next: StoredDocument = {
+          // Build the backup (only for a semantic change), replacement current
+          // fields, and the restore audit row in one atomic file replacement.
+          const changed = room.stored.contentHash !== targetValue.hash ||
+            room.stored.title !== targetValue.title
+          const withBackup: StoredDocument = changed ? {
+            ...room.stored,
+            revisions: [...room.stored.revisions, revisionOf(room.stored, 'pre_restore', null)],
+          } : room.stored
+          const replaced: StoredDocument = {
             ...withBackup,
-            state: encode(replacement),
+            state: target.state,
+            title: targetValue.title,
+            content: targetValue.content,
+            contentHash: targetValue.hash,
+            schemaVersion: CONTENT_SCHEMA_VERSION,
+            revisionCount: withBackup.revisionCount + (changed ? 1 : 0),
+            pendingAutoAt: null,
             epoch: withBackup.epoch + 1,
             updatedAt: new Date().toISOString(),
           }
+          const audit = revisionOf(replaced, 'restore', null, target.id)
+          const next: StoredDocument = { ...replaced, revisions: [...replaced.revisions, audit] }
           try {
             await persist(next)
           } catch (error) {
@@ -409,7 +591,24 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
         if (stopped) return ws.close()
         room.clients.add(ws)
         ws.send(JSON.stringify({ type: 'sync', epoch: room.stored.epoch, update: encode(room.doc) }))
-        ws.on('close', () => room.clients.delete(ws))
+        let disconnectPendingAt: number | null = null
+        ws.on('close', () => {
+          void serialize(id, async () => {
+            room.clients.delete(ws)
+            if (stopped || room.clients.size !== 0) return
+            // Only a durable document write may trigger an auto revision.
+            if (room.stored.pendingAutoAt === null) return
+            if (room.autoTimer) clearTimeout(room.autoTimer)
+            room.autoTimer = undefined
+            disconnectPendingAt = room.stored.pendingAutoAt
+            await materializeAuto(room)
+          }).catch(error => {
+            console.error('Disconnect revision failed:', error)
+            // The pending job is still on disk. Retry the immediate close job
+            // after a bounded pause; the usual delayed deadline may be far away.
+            if (disconnectPendingAt !== null) retryDisconnectAuto(id, room, disconnectPendingAt)
+          })
+        })
         ws.on('message', raw => {
           void serialize(id, async () => {
             if (ws.readyState !== WebSocket.OPEN) return
@@ -427,10 +626,17 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
               const candidate = clone(room.doc)
               try {
                 Y.applyUpdateV2(candidate, update)
-                materialize(candidate)
+                const value = materialize(candidate)
                 const next: StoredDocument = {
                   ...room.stored,
                   state: encode(candidate),
+                  title: value.title,
+                  content: value.content,
+                  contentHash: value.hash,
+                  schemaVersion: CONTENT_SCHEMA_VERSION,
+                  revisionCount: room.stored.revisionCount +
+                    (value.hash !== room.stored.contentHash || value.title !== room.stored.title ? 1 : 0),
+                  pendingAutoAt: Date.now() + autoSnapshotIdleMs,
                   updatedAt: new Date().toISOString(),
                 }
                 await persist(next)
@@ -474,6 +680,20 @@ export async function startSnapshotServer(options: SnapshotServerOptions = {}): 
   })
   const address = httpServer.address()
   if (!address || typeof address === 'string') throw new Error('Unexpected server address')
+
+  // This adapter's delayed jobs live in each document file. Recover them at
+  // process start even when nobody opens the document again.
+  for (const entry of await readdir(dataDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !/^[a-f0-9]{64}\.json$/.test(entry.name)) continue
+    try {
+      const raw = JSON.parse(await readFile(join(dataDir, entry.name), 'utf8')) as { documentId?: unknown }
+      if (typeof raw.documentId !== 'string' || pathFor(raw.documentId) !== join(dataDir, entry.name)) continue
+      const room = await roomFor(raw.documentId)
+      scheduleAuto(raw.documentId, room)
+    } catch (error) {
+      console.error('Revision recovery failed:', error)
+    }
+  }
 
   return {
     port: address.port,
