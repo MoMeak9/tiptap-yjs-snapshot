@@ -20,10 +20,34 @@ npm run build --workspace=@tiptap-yjs-snapshot/v2-core
 - 遇到未知节点或 mark，改用仍然字节确定的 tolerant 规范化，并通过 `unknownTypes` 输出类型名供告警。结构非法时，V2 字段整组不写、`revisionCount` 不推进；调用方仍可持久化原始 state。日志只写错误类别和类型名。
 - `revisionCount` 只在规范化正文哈希或标题发生业务变化时递增。没有业务变化时，保留原 `mtime`。`prepareWrite` 在锁外完成 CPU 工作；`commitWrite` 在文档锁下读基线并写入。
 - 自动修订先做廉价判重，拿文档行锁后再次读最新修订，后者才是权威判断。手动修订是书签，每次请求都写一条。修订 version 从 0 开始，每篇文档单调递增；ctime 至少比上一条大 1ms。
-- 每条修订显式记录固定的 `source_format='v2_json'`，便于存储审计和后续格式演进；它不影响公开列表与详情响应。
+- 新写入修订必须同时有非空 V2 `state`、`contentJson`、`contentHash` 和 `schemaVersion`，并标记 `source_format='v2_json'`。导入的纯 V2 state 历史行可标记 `state_only`；按需生成 JSON 后仍保留这个来源标记。
 - 列表按 `(version DESC, id DESC)` 使用 cursor。列表只取元数据和 `content/state` 存在性，不载入正文或二进制。详情可寻址 `current-<documentId>`，服务层验证其中的 ID 与已授权文档一致。
 - 列表把贡献者映射为 `{username,nickname}`，`resolveDisplayNames` 可批量补充展示名，失败时回退稳定 ID；恢复修订通过 `restoredFromVersion` 标注来源。`restore()` 返回 `{id}`，其中 id 是请求恢复的目标版本，审计版本只写入存储。
 - `RoomReset.flushAndReset` 必须在恢复时阻止新房间加载，先刷新活跃文档，再运行数据库替换，广播 reset 并断开活跃连接。客户端收到 `snapshot restored to <id>, reconnect required` 后需清理本地 Yjs 缓存再重连。
+
+## 历史 state 按需补齐 JSON
+
+详情先通过 `RevisionStore.getDetailRow` 取元数据和 `state` 长度。已有 `contentJson` 时直接返回；只有 V2 state 时，最多允许 **5 MiB** 进入 `projectionDecoder`，并通过 `getState` 按需载入。宿主应把异步 decoder 接到有容量上限的 worker 池，worker 可调用本包 `decodeV2Projection(state, schema, deriveAttribution)`：一次 `Y.applyUpdateV2`、`TiptapTransformer.fromYdoc('default')` 和 schema 规范化产出 JSON 字符串、哈希、schemaVersion 与响应内容，同一份 Y.Doc 与规范化树可用于可选的逐处归属。主请求线程只校验 worker 结果的类型、版本和哈希格式，不再遍历正文。解码后详情返回 `availability='ready'`、`decodedFromState=true` 和规范化哈希；下一次命中已回填 JSON 时 `decodedFromState=false`。**5 MiB 仅限制压缩 state**；展开后的 Y.Doc/JSON 可能大得多，宿主必须为 worker 设置队列并发、内存与运行时间限制。
+
+```ts
+const history = new V2HistoryService({
+  schema, documents, revisions, scheduler, roomReset,
+  projectionDecoder: {
+    decode: (state, context) => projectionWorkerPool.run({ state, context }),
+  },
+})
+
+// 在 worker 内执行，schema 必须与 V2HistoryService 配置一致：
+const result = await decodeV2Projection(state, schema, (doc, canonical) =>
+  deriveAttributionFromSameDoc(doc, canonical),
+)
+```
+
+`backfillProjectionIfMissing` 用 `WHERE content_json IS NULL AND deleted = FALSE` 做 CAS，只写 `content_json`、`content_hash`、`schema_version`、`attribution`；**不改原始 state、来源格式、mtime、版本号或贡献者**。CAS 输给并发请求或写库失败不影响本次成功读取；若期间修订被软删除，详情重查后清除内容并返回 `deleted`。归属推导失败时，worker 返回 `attributionComplete=false`：本次正文可读，但跳过持久回填，让以后还能重试归属，错误类型由 `onProjectionError` 记录。超过 5 MiB、状态损坏或 schema 不认识节点时，详情为 `legacy_failed` 且不能比较，但只要原始 state 存在，`restorable` 仍为真。无 state 时为 `legacy_pending`。worker 忙时应抛 `RevisionProjectionBusyError`，宿主映射为可重试 HTTP 503；`onProjectionError` 只收到错误类型名，避免正文进入日志。当前文档的虚拟详情不做 state 解码。
+
+`CURRENT_SCHEMA_VERSION` 目前为 **1**；`migrateToCurrentSchemaVersion` 只校验版本和已注册迁移，没有预置跨版本转换。这里的“补齐”是从已有 V2 state 生成缺失的 JSON 投影，不表示自动升级 ProseMirror schema。SQL 约束要求导入行的 JSON/hash/schema 三列全空或全有；新写入 `v2_json` 行必须全有。已应用旧版 SQL 的数据库需由自己的迁移工具放宽历史行的 JSON/hash/schema 非空约束并扩展 `source_format`，仅重新执行 `CREATE TABLE IF NOT EXISTS` 不会修改现有表。
+
+导入后先对**最新一条** `state_only` 修订触发详情解码，确认 `content_hash` 已回填，再启用自动建版。若最新行仍缺哈希，自动任务无法与它可靠地做正文语义判重，可能新增内容相同的版本。
 
 ## 接入 PostgreSQL
 

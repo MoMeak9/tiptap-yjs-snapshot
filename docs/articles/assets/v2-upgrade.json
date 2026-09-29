@@ -1,0 +1,42 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "按需补齐可读投影（worker／存储适配器）",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    { "id": "process", "label": "按需读取与派生" },
+    { "id": "outcome", "label": "请求结果" }
+  ],
+  "mainPath": ["detail", "load", "gate", "decode", "normalize", "cas", "ready"],
+  "nodes": [
+    { "id": "detail", "lane": "process", "col": 0, "type": "frontend", "label": "请求历史详情", "sublabel": "指定 revision ID" },
+    { "id": "load", "lane": "process", "col": 1, "type": "database", "label": "读轻量详情行", "sublabel": "content_json / stateBytes", "width": 110 },
+    { "id": "gate", "lane": "process", "col": 2, "type": "security", "label": "判定可用表示", "sublabel": "已有 JSON？state ≤ 5 MiB", "width": 112 },
+    { "id": "decode", "lane": "process", "col": 3, "type": "backend", "label": "按需加载 state", "sublabel": "getState → applyUpdateV2", "width": 116 },
+    { "id": "normalize", "lane": "process", "col": 4, "type": "backend", "label": "生成规范数据", "sublabel": "JSON / hash / 版本 / 归因", "width": 104 },
+    { "id": "cas", "lane": "process", "col": 5, "type": "database", "label": "尽力回填派生列", "sublabel": "content_json IS NULL", "width": 106 },
+    { "id": "ready", "lane": "outcome", "col": 5, "type": "frontend", "label": "返回 ready", "sublabel": "已有内容或本次解码内容" },
+    { "id": "unavailable", "lane": "outcome", "col": 3, "type": "external", "label": "返回不可用", "sublabel": "unavailable：超限 / 解码失败", "width": 116 },
+    { "id": "busy", "lane": "outcome", "col": 4, "type": "external", "label": "返回 503", "sublabel": "升级 worker 繁忙" }
+  ],
+  "edges": [
+    { "from": "detail", "to": "load", "role": "main" },
+    { "from": "load", "to": "gate", "role": "main" },
+    { "from": "gate", "to": "decode", "label": "缺 content_json 且 ≤ 5 MiB", "role": "main" },
+    { "from": "decode", "to": "normalize", "role": "main" },
+    { "from": "normalize", "to": "cas", "role": "main" },
+    { "from": "cas", "to": "ready", "role": "main" },
+    { "from": "gate", "to": "ready", "label": "已有 content_json", "role": "branch" },
+    { "from": "gate", "to": "unavailable", "label": "state 超限", "role": "error" },
+    { "from": "decode", "to": "unavailable", "label": "解码失败", "role": "error" },
+    { "from": "decode", "to": "busy", "label": "worker 繁忙", "role": "error" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "升级的是表示", "items": ["完整 Yjs V2 state 始终是历史快照的权威内容", "从 state 派生当前可读的规范 JSON 与元信息"] },
+    { "dot": "emerald", "title": "原始快照不变", "items": ["归属提取失败跳过 CAS；已解码正文仍可阅读", "CAS 失败不阻断 ready；不改 state、source_format、mtime"] },
+    { "dot": "amber", "title": "边界与退路", "items": ["state 缺失为 legacy_pending；超限或解码失败为 legacy_failed", "worker 繁忙返回 503；此流程不承担跨 Schema 迁移"] }
+  ]
+}

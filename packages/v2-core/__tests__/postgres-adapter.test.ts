@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
 import {
   PostgresDocumentStore, PostgresRevisionStore,
   type RevisionInsert, type SqlConnection, type SqlPool,
@@ -11,6 +12,11 @@ const docRow = {
 }
 
 describe('PostgreSQL adapter transaction contract', () => {
+  it('requires state-only projection columns to be all absent or all present', () => {
+    const schema = readFileSync(new URL('../schema.postgres.sql', import.meta.url), 'utf8')
+    expect(schema).toMatch(/content_json IS NULL AND content_hash IS NULL AND schema_version IS NULL/)
+    expect(schema).toMatch(/content_json IS NOT NULL AND content_hash IS NOT NULL AND schema_version IS NOT NULL/)
+  })
   it('locks the document and inserts a revision on one connection before commit', async () => {
     const calls: Array<{ sql: string; params?: unknown[] }> = []
     let released = false
@@ -90,5 +96,68 @@ describe('PostgreSQL adapter transaction contract', () => {
     expect(sql).toContain('source.version AS restored_from_version')
     expect(sql).not.toContain('r.content_json,')
     expect(sql).not.toContain('r.state,')
+  })
+
+  it('reads detail metadata without state and conditionally backfills only derived fields', async () => {
+    const calls: Array<{ sql: string; params?: unknown[] }> = []
+    const revisions = new PostgresRevisionStore({
+      connect: async () => { throw new Error('unexpected transaction') },
+      query: async <Row extends Record<string, unknown>>(sql: string, params?: unknown[]): Promise<{ rows: Row[] }> => {
+        calls.push({ sql, params })
+        if (sql.startsWith('SELECT') && sql.includes('octet_length(state)')) return { rows: [{
+          id: 'r-state', document_id: 'doc-public', version: 1, type: 'auto', name: null,
+          title: 'Example', content_json: null, content_hash: null, schema_version: null,
+          source_format: 'state_only', created_by: null, contributors: [], attribution: null,
+          ctime: new Date('2026-01-02T00:00:00Z'), mtime: new Date('2026-01-02T00:00:00Z'),
+          deleted: false, restored_from_revision_id: null, state_bytes: 10,
+        }] as unknown as Row[] }
+        if (sql.startsWith('SELECT state')) return { rows: [{ state: Buffer.from([1, 2]) }] as unknown as Row[] }
+        if (sql.startsWith('UPDATE')) return { rows: [{ id: 'r-state' }] as unknown as Row[] }
+        return { rows: [] }
+      },
+    })
+    const row = await revisions.getDetailRow('doc-public', 'r-state')
+    expect(row).toMatchObject({ sourceFormat: 'state_only', contentJson: null, stateBytes: 10 })
+    expect(calls[0].sql).toContain('octet_length(state) AS state_bytes')
+    expect(calls[0].sql).not.toContain(', state,')
+    expect(await revisions.getState('doc-public', 'r-state')).toEqual(new Uint8Array([1, 2]))
+    expect(calls[1].sql).toContain('deleted = FALSE')
+    const filled = await revisions.backfillProjectionIfMissing('doc-public', 'r-state', {
+      contentJson: '{"type":"doc"}', contentHash: 'a'.repeat(64), schemaVersion: 1,
+      attribution: { kind: 'whole', author: 'author-a' },
+    })
+    expect(filled).toBe(true)
+    expect(calls[2].sql).toContain('content_json IS NULL')
+    expect(calls[2].sql).toContain('deleted = FALSE')
+    expect(calls[2].sql).not.toMatch(/SET .*\b(state|source_format|mtime)\b/)
+    expect(calls[2].params?.slice(0, 2)).toEqual(['doc-public', 'r-state'])
+  })
+
+  it('rejects a partially populated imported projection instead of treating it as ready', async () => {
+    const revisions = new PostgresRevisionStore({
+      connect: async () => { throw new Error('unexpected transaction') },
+      query: async <Row extends Record<string, unknown>>(): Promise<{ rows: Row[] }> => ({ rows: [{
+        id: 'r-partial', document_id: 'doc-public', version: 1, type: 'auto', name: null,
+        title: 'Example', content_json: '{"type":"doc"}', content_hash: null, schema_version: null,
+        source_format: 'state_only', created_by: null, contributors: [], attribution: null,
+        ctime: new Date(), mtime: new Date(), deleted: false,
+        restored_from_revision_id: null, state_bytes: 2,
+      }] as unknown as Row[] }),
+    })
+    await expect(revisions.getDetailRow('doc-public', 'r-partial')).rejects.toThrow('partial')
+  })
+
+  it('rejects a v2_json row without its mandatory projection', async () => {
+    const revisions = new PostgresRevisionStore({
+      connect: async () => { throw new Error('unexpected transaction') },
+      query: async <Row extends Record<string, unknown>>(): Promise<{ rows: Row[] }> => ({ rows: [{
+        id: 'r-incomplete', document_id: 'doc-public', version: 1, type: 'auto', name: null,
+        title: 'Example', content_json: null, content_hash: null, schema_version: null,
+        source_format: 'v2_json', created_by: null, contributors: [], attribution: null,
+        ctime: new Date(), mtime: new Date(), deleted: false,
+        restored_from_revision_id: null, state_bytes: 2,
+      }] as unknown as Row[] }),
+    })
+    await expect(revisions.getDetailRow('doc-public', 'r-incomplete')).rejects.toThrow('lacks projection')
   })
 })

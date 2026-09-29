@@ -20,10 +20,34 @@ npm run build --workspace=@tiptap-yjs-snapshot/v2-core
 - Unknown nodes or marks take a still deterministic tolerant canonicalization path and report type names through `unknownTypes` for alerting. For structurally invalid input, V2 fields are not written and `revisionCount` does not advance; the caller may still persist raw state. Logs contain error classes and type names only.
 - `revisionCount` increases only for a business change in canonical body hash or title. `mtime` remains unchanged without such a change. `prepareWrite` does CPU work outside the lock; `commitWrite` reads the baseline and writes under the document lock.
 - An automatic revision performs a cheap deduplication check and then rereads the latest revision under the document row lock; the latter is authoritative. Manual revisions are bookmarks and always insert. Versions start at 0 and rise monotonically per document; `ctime` is at least 1 ms later than the previous revision.
-- Each revision explicitly stores fixed `source_format='v2_json'` for storage auditing and later format evolution. It does not change public list or detail responses.
+- New revision writes require nonempty V2 `state`, `contentJson`, `contentHash`, and `schemaVersion`, with `source_format='v2_json'`. Imported V2 state-only history may use `state_only`; on-demand JSON projection retains that provenance marker.
 - Lists use a `(version DESC, id DESC)` cursor. They fetch metadata and `content/state` presence without loading body JSON or binary state. Detail can address `current-<documentId>` and validates that its ID matches the authorized document.
 - Lists map contributors to `{username,nickname}`. `resolveDisplayNames` can batch-resolve display names and falls back to stable IDs on failure. Restore revisions expose `restoredFromVersion`. `restore()` returns `{id}` where `id` is the requested target revision; the audit revision is stored separately.
 - `RoomReset.flushAndReset` must gate new room loads during restore, flush the active document, perform the database replacement, broadcast reset, and close active connections. After `snapshot restored to <id>, reconnect required`, clients clear the local Yjs cache and reconnect.
+
+## On-demand JSON projection for historical state
+
+Detail first calls `RevisionStore.getDetailRow` for metadata and the state byte length. Stored `contentJson` is returned directly. For a row containing only V2 state, at most **5 MiB** may enter `projectionDecoder`; `getState` loads those bytes only when needed. Connect the async decoder port to a bounded host worker pool. Inside the worker, `decodeV2Projection(state, schema, deriveAttribution)` performs one `Y.applyUpdateV2`, `TiptapTransformer.fromYdoc('default')`, and schema canonicalization. It returns canonical serialized JSON, hash, schema version, and response content; optional attribution comes from the same Y.Doc and canonical tree. The request thread checks only the result's type, version, and hash format, without traversing the document tree. The first successful detail returns `availability='ready'`, `decodedFromState=true`, and the canonical hash; a later read of backfilled JSON returns `decodedFromState=false`. The **5 MiB cap covers compressed state only**. Expanded Y.Doc/JSON can be much larger, so the host must bound worker concurrency, memory, and runtime.
+
+```ts
+const history = new V2HistoryService({
+  schema, documents, revisions, scheduler, roomReset,
+  projectionDecoder: {
+    decode: (state, context) => projectionWorkerPool.run({ state, context }),
+  },
+})
+
+// Execute inside the worker, using the same schema as V2HistoryService:
+const result = await decodeV2Projection(state, schema, (doc, canonical) =>
+  deriveAttributionFromSameDoc(doc, canonical),
+)
+```
+
+`backfillProjectionIfMissing` uses `WHERE content_json IS NULL AND deleted = FALSE` as a compare-and-set and writes only `content_json`, `content_hash`, `schema_version`, and `attribution`. It preserves original state, source format, `mtime`, version, and contributors. A lost CAS or failed backfill cannot fail the successful read; if the revision was soft-deleted during decoding, a final check clears the content and returns `deleted`. If attribution derivation fails, the worker returns `attributionComplete=false`: the current body remains readable, but durable backfill is skipped so attribution can be retried. `onProjectionError` records the error class. Oversized state, invalid state, or unknown schema types yield `legacy_failed` with no diffable content, while `restorable` stays true if the original state exists. No state yields `legacy_pending`. A saturated worker should throw `RevisionProjectionBusyError`, which the host maps to retryable HTTP 503. `onProjectionError` receives error class names only, keeping body content out of logs. The virtual current detail never decodes state.
+
+`CURRENT_SCHEMA_VERSION` is **1**. `migrateToCurrentSchemaVersion` is a version gate for registered migrations; no cross-version conversion is bundled. This projection fills JSON missing from existing V2 state and does not automatically migrate the ProseMirror schema. The SQL constraint requires an imported row's JSON/hash/schema columns to be either all absent or all present; new `v2_json` writes require all three. An existing database needs an explicit migration to relax historical JSON/hash/schema constraints and expand `source_format`; rerunning `CREATE TABLE IF NOT EXISTS` will not alter an existing table.
+
+After import, trigger detail decoding for the **latest** `state_only` revision and confirm its `content_hash` has been backfilled before enabling automatic revision creation. Without that hash, the automatic job cannot reliably compare semantic content with the latest row and may create a duplicate revision.
 
 ## PostgreSQL integration
 

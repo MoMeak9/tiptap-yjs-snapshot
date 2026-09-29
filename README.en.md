@@ -14,12 +14,12 @@ A runnable local Tiptap + Yjs demo remains in the repository so readers can obse
 
 | Path | Public content |
 | --- | --- |
-| [`packages/v2-core/`](packages/v2-core/README.en.md) | Adapted backend V2 algorithms and service: coherent JSON/hash, collaboration persistence fields, delayed materialization, manual revisions, cursor list, detail, and restore; includes a PostgreSQL schema and storage adapter |
+| [`packages/v2-core/`](packages/v2-core/README.en.md) | Adapted backend V2 algorithms and service: coherent JSON/hash, collaboration persistence fields, delayed materialization, manual revisions, on-demand JSON backfill for historical state, cursor list, detail, and restore; includes a PostgreSQL schema and storage adapter |
 | [`packages/revision-history/`](packages/revision-history/README.md) | Adapted frontend V2 API, controller, Myers/structural diff, attribution index, Lit history panel, and isolated read-only ProseMirror viewer |
 | `src/server/`, `src/client/` | End-to-end local demo with file storage, WebSocket, REST, and a StarterKit editor |
 | `docs/` | [Architecture](docs/architecture.en.md), [data and API contract](docs/contract.en.md), [source mapping and adaptation boundary](docs/v2-extraction.en.md) |
 
-Chinese long-form article draft: [Why revision history stores both Yjs state and JSON](docs/articles/v2-revision-history-wechat.zh-CN.md), with two exportable diagrams.
+Chinese long-form article draft: [Why revision history stores both Yjs state and JSON](docs/articles/v2-revision-history-wechat.zh-CN.md), with three exportable diagrams for data flow, restore, and historical snapshot upgrade.
 
 ## Run locally
 
@@ -62,11 +62,17 @@ flowchart LR
   G --> H[Reset collaboration room and client Y.Doc]
 ```
 
-The body lives in `Y.XmlFragment('default')` and the title in `Y.Text('title')`. The same Y.Doc produces full V2 state and canonical JSON: state is authoritative for restore, while JSON supports detail, preview, and diff. Automatic revisions are scheduled after the current state is persisted and deduplicated by semantic body hash plus title; manual revisions may repeat identical content. The history viewer has a separate read-only editor instance and never writes historical JSON into the live editor. After restore, connected clients must discard their old Y.Doc and reconnect. Clients with offline storage must also clear that document's cache to prevent stale CRDT content from merging back.
+The body lives in `Y.XmlFragment('default')` and the title in `Y.Text('title')`. New revisions derive full V2 state and canonical JSON from the same Y.Doc: state is authoritative for restore, while JSON supports detail, preview, and diff. Automatic revisions are scheduled after the current state is persisted and deduplicated by semantic body hash plus title; manual revisions may repeat identical content. The history viewer has a separate read-only editor instance and never writes historical JSON into the live editor. After restore, connected clients must discard their old Y.Doc and reconnect. Clients with offline storage must also clear that document's cache to prevent stale CRDT content from merging back.
+
+### On-demand upgrade of historical snapshots
+
+Imported historical revisions can contain **complete V2 state** but lack JSON for preview and diff. Lists only check field presence. On the first detail request for such a revision, the service loads its state on demand and decodes, canonicalizes, and hashes it in a host-supplied bounded worker pool using the current ProseMirror schema. At most **5 MiB** of state enters the decoder. The compare-and-set backfill writes derived JSON, hash, `schemaVersion`, and optional attribution only while JSON remains absent; original state, provenance, timestamps, and version are preserved. If attribution derivation fails, the content remains readable but backfill is skipped so a later request can retry it. A failed backfill write does not fail an already decoded read of a non-deleted row.
+
+`availability` says whether the revision can be previewed; `restorable` independently says whether its original state exists. Oversized, undecodable, or schema-incompatible state cannot be previewed or compared; restore validates the original state separately. The host maps a saturated worker to retryable HTTP 503. This upgrade **fills a missing historical JSON projection**. It does not compact an active Y.Doc state or automatically migrate between ProseMirror schemas. The current `schemaVersion` is **1**, and the repository has no batch-upgrade worker. See the [architecture](docs/architecture.en.md#3-on-demand-upgrade-of-historical-snapshots) and [contract](docs/contract.en.md#on-demand-historical-snapshot-upgrade-contract) for the flow and failure semantics.
 
 ## Integration boundaries
 
-`packages/v2-core` accepts a host ProseMirror schema, `DocumentStore`, `RevisionStore`, `Scheduler`, `RoomReset`, and optional attribution, event, and failure-marker ports. The repository provides a PostgreSQL storage reference adapter. The host supplies the queue, cross-instance room reset, authorization, and collaboration service. `packages/revision-history` accepts a service prefix, authentication, mount points, the host editor runtime, and optional read-only media NodeViews.
+`packages/v2-core` accepts a host ProseMirror schema, `DocumentStore`, `RevisionStore`, `Scheduler`, `RoomReset`, and optional `RevisionProjectionDecoder`, attribution, event, and failure-marker ports. The repository provides a PostgreSQL storage reference adapter. The host supplies the bounded decoder worker pool, queue, cross-instance room reset, authorization, and collaboration service. `packages/revision-history` accepts a service prefix, authentication, mount points, the host editor runtime, and optional read-only media NodeViews.
 
 For standard Redis integration, use `createRedisDelayedJobRegistry` ([Redis 6.2+ `GETDEL`](https://redis.io/docs/latest/commands/getdel/) and standard `EVAL`) and `createBullMQRevisionQueueDriver` with `createDurableScheduler`. The interfaces also allow another durable queue and TTL registry. With Redis Cluster, the registry's per-document keys share one hash tag, while the BullMQ Queue and Worker share a separate queue hash tag. See the [backend package guide](packages/v2-core/README.en.md) for wiring.
 

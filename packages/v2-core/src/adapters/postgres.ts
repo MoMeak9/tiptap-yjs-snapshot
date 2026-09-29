@@ -1,6 +1,6 @@
 import type {
   ClaimedInterval, DocumentPatch, DocumentRecord, DocumentStore, DocumentTransaction, RevisionInsert,
-  RevisionHead, RevisionListRow, RevisionRecord, RevisionStore,
+  RevisionDetailRow, RevisionHead, RevisionListRow, RevisionProjection, RevisionRecord, RevisionStore,
 } from '../ports'
 import type { RevisionCursor } from '../cursor'
 
@@ -28,18 +28,17 @@ interface DocumentRow extends Record<string, unknown> {
   deleted: boolean
 }
 
-interface RevisionRow extends Record<string, unknown> {
+interface RevisionBaseRow extends Record<string, unknown> {
   id: string
   document_id: string
   version: number
   type: RevisionRecord['type']
   name: string | null
   title: string
-  content_json: string
-  content_hash: string
-  schema_version: number
-  source_format: 'v2_json'
-  state: Uint8Array
+  content_json: string | null
+  content_hash: string | null
+  schema_version: number | null
+  source_format: RevisionRecord['sourceFormat']
   created_by: string | null
   contributors: string[] | string
   attribution: unknown | null
@@ -47,6 +46,14 @@ interface RevisionRow extends Record<string, unknown> {
   mtime: Date | string
   deleted: boolean
   restored_from_revision_id: string | null
+}
+
+interface RevisionRow extends RevisionBaseRow {
+  state: Uint8Array
+}
+
+interface RevisionDetailSqlRow extends RevisionBaseRow {
+  state_bytes: number | null
 }
 
 interface RevisionListSqlRow extends Record<string, unknown> {
@@ -87,17 +94,28 @@ function parseJson(value: unknown): unknown {
   return typeof value === 'string' ? JSON.parse(value) as unknown : value
 }
 
-function mapRevision(row: RevisionRow): RevisionRecord {
+function mapRevisionBase(row: RevisionBaseRow): Omit<RevisionRecord, 'state'> {
+  const present = [row.content_json, row.content_hash, row.schema_version].map(value => value !== null)
+  if (present.some(Boolean) && !present.every(Boolean)) throw new TypeError('Revision projection columns are partial')
+  if (row.source_format === 'v2_json' && !present.every(Boolean)) throw new TypeError('New V2 revision lacks projection')
   return {
     id: row.id, documentId: row.document_id, version: Number(row.version), type: row.type,
     name: row.name, title: row.title, contentJson: row.content_json,
-    contentHash: row.content_hash, schemaVersion: Number(row.schema_version),
+    contentHash: row.content_hash, schemaVersion: row.schema_version === null ? null : Number(row.schema_version),
     sourceFormat: row.source_format,
-    state: new Uint8Array(row.state), createdBy: row.created_by,
+    createdBy: row.created_by,
     contributors: parseArray(row.contributors), attribution: parseJson(row.attribution),
     ctime: new Date(row.ctime), mtime: new Date(row.mtime), deleted: row.deleted,
     restoredFromRevisionId: row.restored_from_revision_id,
   }
+}
+
+function mapRevision(row: RevisionRow): RevisionRecord {
+  return { ...mapRevisionBase(row), state: new Uint8Array(row.state) }
+}
+
+function mapRevisionDetail(row: RevisionDetailSqlRow): RevisionDetailRow {
+  return { ...mapRevisionBase(row), stateBytes: Number(row.state_bytes ?? 0) }
 }
 
 type Queryable = Pick<SqlPool, 'query'>
@@ -188,7 +206,7 @@ export class PostgresRevisionStore implements RevisionStore {
   async latest(documentId: string, tx?: DocumentTransaction): Promise<RevisionHead | null> {
     const client = this.client(tx)
     const { rows } = await client.query<{ id: string; content_hash: string; title: string }>(
-      `SELECT id, content_hash, title FROM v2_revisions WHERE document_id = $1 AND deleted = FALSE ORDER BY version DESC, id DESC LIMIT 1`,
+      `SELECT id, COALESCE(content_hash, '') AS content_hash, title FROM v2_revisions WHERE document_id = $1 AND deleted = FALSE ORDER BY version DESC, id DESC LIMIT 1`,
       [documentId],
     )
     return rows[0] ? { id: rows[0].id, contentHash: rows[0].content_hash, title: rows[0].title } : null
@@ -200,6 +218,23 @@ export class PostgresRevisionStore implements RevisionStore {
       [documentId, revisionId],
     )
     return rows[0] ? mapRevision(rows[0]) : null
+  }
+
+  async getDetailRow(documentId: string, revisionId: string): Promise<RevisionDetailRow | null> {
+    const columns = REVISION_COLUMNS.replace(', state,', ', octet_length(state) AS state_bytes,')
+    const { rows } = await this.pool.query<RevisionDetailSqlRow>(
+      `SELECT ${columns} FROM v2_revisions WHERE document_id = $1 AND id = $2 LIMIT 1`,
+      [documentId, revisionId],
+    )
+    return rows[0] ? mapRevisionDetail(rows[0]) : null
+  }
+
+  async getState(documentId: string, revisionId: string): Promise<Uint8Array | null> {
+    const { rows } = await this.pool.query<{ state: Uint8Array | null }>(
+      'SELECT state FROM v2_revisions WHERE document_id = $1 AND id = $2 AND deleted = FALSE LIMIT 1',
+      [documentId, revisionId],
+    )
+    return rows[0]?.state ? new Uint8Array(rows[0].state) : null
   }
 
   async list(documentId: string, cursor: RevisionCursor | null, limitPlusOne: number): Promise<readonly RevisionListRow[]> {
@@ -250,6 +285,16 @@ export class PostgresRevisionStore implements RevisionStore {
     )
     if (!rows[0]) throw new Error('Revision insert did not return a row')
     return mapRevision(rows[0])
+  }
+
+  async backfillProjectionIfMissing(documentId: string, revisionId: string, projection: RevisionProjection): Promise<boolean> {
+    const { rows } = await this.pool.query<{ id: string }>(
+      `UPDATE v2_revisions SET content_json = $3, content_hash = $4, schema_version = $5, attribution = $6::jsonb` +
+      ` WHERE document_id = $1 AND id = $2 AND content_json IS NULL AND deleted = FALSE RETURNING id`,
+      [documentId, revisionId, projection.contentJson, projection.contentHash, projection.schemaVersion,
+        projection.attribution === null ? null : JSON.stringify(projection.attribution)],
+    )
+    return rows.length > 0
   }
 
   async mergeInterval(revisionId: string, interval: ClaimedInterval, tx: DocumentTransaction): Promise<void> {

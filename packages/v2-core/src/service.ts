@@ -8,7 +8,7 @@ import type {
   CanonicalizationFailureMarker, DocumentContext, DocumentRecord,
   DocumentStore, DocumentWriteClient, EventPublisher, IntervalPort, RevisionInsert, RevisionJob,
   RevisionListRow, RevisionRecord, RevisionSource, RevisionStore, RoomReset,
-  Scheduler, V2StateCodec,
+  Scheduler, V2StateCodec, RevisionProjectionDecoder, RevisionProjectionResult,
 } from './ports'
 import { yjsV2StateCodec } from './state-codec'
 
@@ -19,6 +19,15 @@ export class RevisionNotFoundError extends Error {
 export class RevisionUnavailableError extends Error {
   constructor() { super('Revision has no complete V2 content and Yjs state'); this.name = 'RevisionUnavailableError' }
 }
+
+/** Map to HTTP 503. A saturated/unavailable decoder is retryable. */
+export class RevisionProjectionBusyError extends Error {
+  readonly statusCode = 503
+  readonly retryable = true
+  constructor() { super('Revision projection decoder is busy'); this.name = 'RevisionProjectionBusyError' }
+}
+
+export const MAX_DECODE_STATE_BYTES = 5 * 1024 * 1024
 
 export class DocumentNotFoundError extends Error {
   constructor() { super('Document not found'); this.name = 'DocumentNotFoundError' }
@@ -37,6 +46,8 @@ export interface V2HistoryOptions {
   readonly scheduler: Scheduler
   readonly roomReset: RoomReset
   readonly stateCodec?: V2StateCodec
+  /** Required for state-only detail reads; production hosts should execute it in a worker pool. */
+  readonly projectionDecoder?: RevisionProjectionDecoder
   readonly failureMarker?: CanonicalizationFailureMarker
   readonly interval?: IntervalPort
   readonly events?: EventPublisher
@@ -48,6 +59,7 @@ export interface V2HistoryOptions {
   readonly resolveDisplayNames?: (actorIds: readonly string[]) => Promise<ReadonlyMap<string, string>>
   readonly onEventError?: (kind: 'revision.created' | 'revision.restored', errorClass: string) => void
   readonly onMarkerError?: (operation: 'mark' | 'clear', errorClass: string) => void
+  readonly onProjectionError?: (operation: 'decode' | 'attribution' | 'backfill', errorClass: string) => void
 }
 
 const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789'
@@ -277,19 +289,95 @@ export class V2HistoryService {
         attribution: null, decodedFromState: false,
       }
     }
-    const row = await this.options.revisions.get(documentId, revisionId)
+    const row = await this.options.revisions.getDetailRow(documentId, revisionId)
     if (!row) throw new RevisionNotFoundError()
     const names = await this.displayNames([...row.contributors, ...(row.createdBy ? [row.createdBy] : [])])
     const person = (username: string) => ({ username, nickname: names.get(username)?.trim() || username })
+    let restorable = !row.deleted && row.stateBytes > 0
+    let availability: 'ready' | 'legacy_pending' | 'legacy_failed' | 'deleted'
+    let content: JSONContent | null = null
+    let contentHash: string | null = null
+    let attribution: unknown | null = null
+    let decodedFromState = false
+    let recheckVisibility = false
+    if (row.deleted) {
+      availability = 'deleted'
+    } else if (row.contentJson !== null) {
+      availability = 'ready'
+      content = JSON.parse(row.contentJson) as JSONContent
+      contentHash = row.contentHash || hashStoredJson(row.contentJson)
+      attribution = row.attribution
+    } else if (row.stateBytes === 0) {
+      availability = 'legacy_pending'
+    } else if (row.stateBytes > MAX_DECODE_STATE_BYTES || !this.options.projectionDecoder) {
+      availability = 'legacy_failed'
+    } else {
+      const state = await this.options.revisions.getState(documentId, revisionId)
+      if (!state?.byteLength) {
+        availability = 'legacy_pending'
+        restorable = false
+        recheckVisibility = true
+      } else if (state.byteLength > MAX_DECODE_STATE_BYTES) {
+        availability = 'legacy_failed'
+      } else {
+        try {
+          const decoded = await this.options.projectionDecoder.decode(state, {
+            documentId, revisionId, version: row.version,
+          })
+          if (!validProjection(decoded)) throw new TypeError('Invalid worker projection')
+          // The worker has already canonicalized and hashed this tree. Repeating
+          // that CPU/memory work on the request event loop defeats the pool.
+          content = decoded.content
+          contentHash = decoded.contentHash
+          attribution = decoded.attributionComplete
+            ? preferStoredAttribution(row.attribution, decoded.attribution)
+            : preferStoredAttribution(row.attribution, null)
+          decodedFromState = true
+          availability = 'ready'
+          if (!decoded.attributionComplete) {
+            // A null result from a failed derivation is not authoritative.
+            this.reportProjectionError('attribution', decoded.attributionErrorClass || 'UnknownError')
+            recheckVisibility = true
+          } else {
+            try {
+              const backfilled = await this.options.revisions.backfillProjectionIfMissing(documentId, revisionId, {
+                contentJson: decoded.contentJson, contentHash: decoded.contentHash,
+                schemaVersion: decoded.schemaVersion, attribution,
+              })
+              recheckVisibility = !backfilled
+            } catch (error) {
+              // The read succeeded; a best-effort CAS failure must not fail it.
+              this.reportProjectionError('backfill', error)
+              recheckVisibility = true
+            }
+          }
+        } catch (error) {
+          if (error instanceof RevisionProjectionBusyError) throw error
+          this.reportProjectionError('decode', error)
+          availability = 'legacy_failed'
+        }
+      }
+    }
+    if (recheckVisibility) {
+      let latest: Awaited<ReturnType<RevisionStore['getDetailRow']>> = null
+      try { latest = await this.options.revisions.getDetailRow(documentId, revisionId) }
+      catch { /* fail closed if visibility cannot be verified after a missed CAS */ }
+      if (!latest || latest.deleted) {
+        availability = 'deleted'
+        restorable = false
+        content = null
+        contentHash = null
+        attribution = null
+        decodedFromState = false
+      }
+    }
     return {
       id: row.id, documentId, version: row.version, type: row.type, name: row.name,
       title: row.title, createdBy: row.createdBy, createdByUser: row.createdBy ? person(row.createdBy) : null,
       collaborators: row.contributors.map(person),
-      ctime: row.ctime.getTime(), availability: row.deleted ? 'deleted' as const : 'ready' as const,
-      diffEligible: !row.deleted, restorable: !row.deleted && row.state.byteLength > 0,
-      content: row.deleted ? null : JSON.parse(row.contentJson) as JSONContent,
-      contentHash: row.deleted ? null : row.contentHash || hashStoredJson(row.contentJson),
-      attribution: row.attribution, decodedFromState: false,
+      ctime: row.ctime.getTime(), availability,
+      diffEligible: availability === 'ready', restorable,
+      content, contentHash, attribution, decodedFromState,
     }
   }
 
@@ -297,6 +385,13 @@ export class V2HistoryService {
     if (!this.options.resolveDisplayNames || actorIds.length === 0) return new Map()
     try { return await this.options.resolveDisplayNames([...new Set(actorIds)]) }
     catch { return new Map() }
+  }
+
+  private reportProjectionError(operation: 'decode' | 'attribution' | 'backfill', error: unknown): void {
+    const candidate = typeof error === 'string' ? error : errorClass(error)
+    const className = /^[A-Za-z][A-Za-z0-9_]{0,80}$/.test(candidate) ? candidate : 'UnknownError'
+    try { this.options.onProjectionError?.(operation, className) }
+    catch { /* diagnostics cannot turn a successful read into a failure */ }
   }
 
   /**
@@ -387,4 +482,30 @@ export class V2HistoryService {
 
 function hashStoredJson(serialized: string): string {
   return createHash('sha256').update(serialized, 'utf8').digest('hex')
+}
+
+function errorClass(error: unknown): string {
+  return error instanceof Error ? error.name : 'UnknownError'
+}
+
+/** Worker contract checks only scalars; the host worker owns full tree validation. */
+function validProjection(result: RevisionProjectionResult): boolean {
+  return result !== null && typeof result === 'object' &&
+    result.content !== null && typeof result.content === 'object' && !Array.isArray(result.content) &&
+    typeof result.contentJson === 'string' && result.contentJson.startsWith('{') &&
+    typeof result.contentHash === 'string' && /^[0-9a-f]{64}$/.test(result.contentHash) &&
+    result.schemaVersion === CURRENT_SCHEMA_VERSION &&
+    typeof result.attributionComplete === 'boolean' && result.attribution !== undefined
+}
+
+/** Whole-document credit and captured deletions cannot be recovered from state coordinates. */
+function preferStoredAttribution(stored: unknown | null, derived: unknown | null): unknown | null {
+  if (!stored || typeof stored !== 'object') return derived
+  const candidate = stored as { kind?: unknown; author?: unknown; deletions?: unknown }
+  if (candidate.kind === 'whole' && typeof candidate.author === 'string' && candidate.author) return stored
+  if (candidate.kind !== 'ranges' || !Array.isArray(candidate.deletions) || candidate.deletions.length === 0) return derived
+  if (!derived || typeof derived !== 'object') return { kind: 'ranges', ranges: [], deletions: candidate.deletions }
+  const output = derived as { kind?: unknown; ranges?: unknown }
+  if (output.kind !== 'ranges' || !Array.isArray(output.ranges)) return derived
+  return { ...output, deletions: candidate.deletions }
 }

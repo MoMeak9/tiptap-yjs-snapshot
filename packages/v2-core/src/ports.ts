@@ -49,7 +49,7 @@ export interface DocumentStore extends DocumentWriteClient {
 
 export type RevisionType = 'auto' | 'open_api' | 'manual' | 'pre_restore' | 'restore'
 
-/** All V2 revision types retain the original Yjs V2 state for faithful restore. */
+/** All revisions retain complete Yjs V2 state. New writes also require JSON. */
 export interface RevisionRecord {
   readonly id: string
   readonly documentId: string
@@ -57,10 +57,11 @@ export interface RevisionRecord {
   readonly type: RevisionType
   readonly name: string | null
   readonly title: string
-  readonly contentJson: string
-  readonly contentHash: string
-  readonly schemaVersion: number
-  readonly sourceFormat: 'v2_json'
+  readonly contentJson: string | null
+  readonly contentHash: string | null
+  readonly schemaVersion: number | null
+  /** An imported state-only row keeps its provenance after JSON backfill. */
+  readonly sourceFormat: 'v2_json' | 'state_only'
   readonly state: Uint8Array
   readonly createdBy: string | null
   readonly contributors: readonly string[]
@@ -69,6 +70,30 @@ export interface RevisionRecord {
   readonly mtime: Date
   readonly deleted: boolean
   readonly restoredFromRevisionId: string | null
+}
+
+/** Detail's cheap projection never loads potentially large state bytes. */
+export type RevisionDetailRow = Omit<RevisionRecord, 'state'> & { readonly stateBytes: number }
+
+export interface RevisionProjection {
+  readonly contentJson: string
+  readonly contentHash: string
+  readonly schemaVersion: number
+  readonly attribution: unknown | null
+}
+
+/** A complete worker result. The service trusts the worker's canonical tree/hash. */
+export interface RevisionProjectionResult extends RevisionProjection {
+  readonly content: JSONContent
+  /** False means optional attribution extraction failed; skip durable backfill and retry later. */
+  readonly attributionComplete: boolean
+  /** Safe class name only, never an error message or document content. */
+  readonly attributionErrorClass?: string
+}
+
+/** Host runs this port in a bounded worker pool; it must decode one state once. */
+export interface RevisionProjectionDecoder {
+  decode(state: Uint8Array, context: { readonly documentId: string; readonly revisionId: string; readonly version: number }): Promise<RevisionProjectionResult>
 }
 
 /** The list projection intentionally has no contentJson or state property. */
@@ -114,8 +139,12 @@ export interface RevisionStore {
   /** latest and list exclude deleted rows and sort by (version DESC, id DESC). */
   latest(documentId: string, tx?: DocumentTransaction): Promise<RevisionHead | null>
   get(documentId: string, revisionId: string): Promise<RevisionRecord | null>
+  getDetailRow(documentId: string, revisionId: string): Promise<RevisionDetailRow | null>
+  getState(documentId: string, revisionId: string): Promise<Uint8Array | null>
   list(documentId: string, cursor: RevisionCursor | null, limitPlusOne: number): Promise<readonly RevisionListRow[]>
   insert(input: RevisionInsert, tx: DocumentTransaction): Promise<RevisionRecord>
+  /** CAS updates only the derived projection; a competing writer wins. */
+  backfillProjectionIfMissing(documentId: string, revisionId: string, projection: RevisionProjection): Promise<boolean>
   /** Called only inside the lock when another job just wrote the same revision. */
   mergeInterval?(revisionId: string, interval: ClaimedInterval, tx: DocumentTransaction): Promise<void>
 }

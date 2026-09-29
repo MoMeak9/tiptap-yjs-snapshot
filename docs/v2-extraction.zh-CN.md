@@ -2,7 +2,7 @@
 
 [English](v2-extraction.en.md) · 简体中文
 
-本仓库的主要交付物是由现有 **V2 修订历史实现**改造的可复用前后端代码。这里的 V2 是修订历史的数据与交互契约：当前文档和每条可恢复修订保存同源的完整 Yjs V2 state 与规范化 Tiptap JSON；列表、详情、比较、归属和恢复围绕这两份表示协作。`Y.encodeSnapshotV2` 的轻量元数据不能独立还原正文。
+本仓库的主要交付物是由现有 **V2 修订历史实现**改造的可复用前后端代码。这里的 V2 是修订历史的数据与交互契约：当前文档与新写入修订保存同源的完整 Yjs V2 state 和规范化 Tiptap JSON；导入的历史修订可暂时只有完整 V2 state，在读取详情时按需补齐 JSON。列表、详情、比较、归属和恢复围绕这两份表示协作。`Y.encodeSnapshotV2` 的轻量元数据不能独立还原正文。
 
 ## 设计参考与代码来源
 
@@ -19,12 +19,18 @@
 | `packages/server/src/modules/revision-queue/{revision-dedup,revision-queue.processor,revision-queue.service}.ts` | `packages/v2-core/src/service.ts`、`src/adapters/{scheduler,redis}.ts` | 持久化后延迟调度、断连触发、锁前与锁内两次判重、区间归属的 claim/restore；队列与登记表可由宿主提供或使用标准环境适配器 |
 | `packages/server/src/modules/revision-persistence/revision-insert.ts` | `packages/v2-core/src/adapters/postgres.ts`、`schema.postgres.sql` | 统一插入字段、文档锁下分配递增版本与时间；公开参考适配改用 PostgreSQL，不依赖源系统的 ORM 或表名 |
 | `packages/server/src/modules/revision-manual/revision-manual.service.ts` | `V2HistoryService.createManual` | 手动命名版本允许相同内容重复保存 |
-| `packages/server/src/modules/revision-list/{revision-cursor,revision-current,revision-list.service,revision-detail.service}.ts` | `packages/v2-core/src/cursor.ts`、`service.ts` | 不透明游标、仅元数据的列表、`current-<documentId>` 虚拟当前详情和按文档隔离的读取 |
+| `packages/server/src/modules/revision-list/{revision-cursor,revision-current,revision-list.service,revision-detail.service}.ts` | `packages/v2-core/src/cursor.ts`、`service.ts`、`state-codec.ts` | 不透明游标、仅元数据的列表、`current-<documentId>` 虚拟当前详情和按文档隔离的读取；公开适配增加完整 V2 state 历史行的按需 JSON 投影 |
 | `packages/server/src/modules/snapshot/snapshot.service.ts` 中的 V2 恢复链路 | `V2HistoryService.restore`、`state-codec.ts`、`RoomReset` 端口 | 使用目标原始完整 V2 state 替换当前文档、保存恢复前状态、记恢复来源、重置活跃协同房间 |
 
-后端包的入口是 `packages/v2-core/src/index.ts`。`DocumentStore`、`RevisionStore`、`Scheduler`、`RoomReset`、可选的 `IntervalPort` / `EventPublisher` / 失败标记端口定义在 `ports.ts`。HTTP 控制器和身份授权属于宿主层；在调用 `list`、`detail`、`createManual` 或 `restore` 前，宿主必须验证文档访问权限，再构造 `DocumentContext`。PostgreSQL schema 与驱动包装示例见 [`packages/v2-core/README.md`](../packages/v2-core/README.md)。
+后端包的入口是 `packages/v2-core/src/index.ts`。`DocumentStore`、`RevisionStore`、`Scheduler`、`RoomReset`、可选的 `RevisionProjectionDecoder`、`IntervalPort` / `EventPublisher` / 失败标记端口定义在 `ports.ts`。HTTP 控制器和身份授权属于宿主层；在调用 `list`、`detail`、`createManual` 或 `restore` 前，宿主必须验证文档访问权限，再构造 `DocumentContext`。PostgreSQL schema 与驱动包装示例见 [`packages/v2-core/README.md`](../packages/v2-core/README.md)。
 
 队列适配是通用化改造：源环境的代理命令限制处理未移植，公开版本通过结构化 BullMQ 驱动与标准 Redis 6.2+ 的 `EVAL` / `GETDEL` 登记表接入；也可以注入其他持久队列与 TTL 登记表。这一适配只处理修订任务，不提供协同文档或 awareness 同步；房间重置仍由独立的 `RoomReset` 端口承担。Cluster 同槽要求见[后端包说明](../packages/v2-core/README.md)。
+
+### 历史快照升级的公开实践
+
+公开包对导入的 `sourceFormat='state_only'` 修订提供**读取详情时按需补齐 JSON**。列表仍只查元数据；详情先读取 state 字节数，超过 **5 MiB** 不进入解码器。宿主应将异步 `RevisionProjectionDecoder` 接入有界 worker 池，使用与服务一致的 ProseMirror schema；`decodeV2Projection` 可在 worker 内从同一 Y.Doc 生成规范化正文、哈希与可选归属。归属提取成功后，回填按 `content_json IS NULL` 做 CAS，仅更新 JSON、内容哈希、`schemaVersion` 和归属，保留原始 state、来源标记、`mtime` 和版本。归属提取失败时仍返回可读正文，但跳过回填以便重试；CAS 未命中或写库失败后会复查软删除状态。worker 忙由宿主映射为可重试 HTTP 503。
+
+`availability` 与 `restorable` 分别回答可否预览和原始 state 是否存在。状态超限、解码失败或 schema 不兼容使详情不可比较，不自动删除原始 state；恢复时仍须独立验证该 state。解码期间若记录被软删除且复查发现，详情清除派生内容。新表约束要求 `state_only` 的 JSON/哈希/schema 版本三列全空或全有。当前 `schemaVersion` 为 **1**，仓库没有预置跨 schema 迁移或批量升级 worker。这是历史 JSON 投影补齐，不是活跃协同 state 压缩。详见[架构](architecture.zh-CN.md#3-历史快照按需升级)及[数据契约](contract.zh-CN.md#历史快照按需升级契约)。
 
 ## 前端模块映射
 
@@ -54,4 +60,4 @@
 
 ## 验证范围
 
-包级测试使用合成文档覆盖同源 JSON/state、语义判重、手动重复版本、游标及虚拟当前详情、恢复和前端异步状态；仓库根目录还保留本机演示测试。`npm run check:public` 扫描公开文件中的私有标识与敏感模式。测试不会替代宿主环境中的 Schema 往返、数据库并发、队列故障、跨实例驱逐和离线缓存恢复演练。
+包级测试使用合成文档覆盖同源 JSON/state、语义判重、手动重复版本、游标及虚拟当前详情、历史 state 按需补齐、恢复和前端异步状态；仓库根目录还保留本机演示测试。`npm run check:public` 扫描公开文件中的私有标识与敏感模式。测试不会替代宿主环境中的 Schema 往返、数据库并发、有界 worker 池满载、队列故障、跨实例驱逐和离线缓存恢复演练。

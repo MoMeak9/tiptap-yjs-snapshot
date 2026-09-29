@@ -19,10 +19,18 @@ CREATE TABLE IF NOT EXISTS v2_revisions (
   type TEXT NOT NULL CHECK (type IN ('auto', 'open_api', 'manual', 'pre_restore', 'restore')),
   name TEXT,
   title TEXT NOT NULL,
-  content_json TEXT NOT NULL,
-  content_hash VARCHAR(64) NOT NULL,
-  schema_version INTEGER NOT NULL,
-  source_format TEXT NOT NULL DEFAULT 'v2_json' CHECK (source_format = 'v2_json'),
+  -- Imported V2 state-only rows may initially lack a derived JSON projection.
+  -- All newly inserted v2_json rows still require the complete representation.
+  content_json TEXT,
+  content_hash VARCHAR(64),
+  schema_version INTEGER,
+  source_format TEXT NOT NULL DEFAULT 'v2_json'
+    CHECK (source_format IN ('v2_json', 'state_only')),
+  CONSTRAINT v2_revision_projection_check CHECK (
+    (source_format = 'state_only' AND
+      content_json IS NULL AND content_hash IS NULL AND schema_version IS NULL) OR
+    (content_json IS NOT NULL AND content_hash IS NOT NULL AND schema_version IS NOT NULL)
+  ),
   state BYTEA NOT NULL CHECK (octet_length(state) > 0),
   created_by TEXT,
   contributors JSONB NOT NULL DEFAULT '[]'::jsonb,

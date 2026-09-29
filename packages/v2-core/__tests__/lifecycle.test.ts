@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Schema } from '@tiptap/pm/model'
 import StarterKit from '@tiptap/starter-kit'
 import { TiptapTransformer } from '@hocuspocus/transformer'
@@ -6,10 +6,11 @@ import * as Y from 'yjs'
 import { createRevisionApiClient } from '../../revision-history/src/api/revision-api-client'
 import {
   buildCanonicalContent, commitDocumentHistoryWrite, currentRevisionId,
-  prepareDocumentHistoryWrite, V2HistoryService,
+  prepareDocumentHistoryWrite, V2HistoryService, RevisionProjectionBusyError, decodeV2Projection,
   type DocumentPatch, type DocumentRecord, type DocumentStore,
   type DocumentTransaction, type RevisionInsert, type RevisionListRow,
   type RevisionRecord, type RevisionStore,
+  type RevisionProjectionDecoder, type V2HistoryOptions,
 } from '../src/index'
 
 const schema = new Schema({
@@ -44,6 +45,7 @@ class Memory implements DocumentStore, RevisionStore {
   onFirstLock?: () => Promise<void>
   readLocks = 0
   transactions = 0
+  backfillFailure = false
 
   async read(id: string) { return id === this.current.id ? this.current : null }
   async write(id: string, patch: DocumentPatch) {
@@ -75,10 +77,29 @@ class Memory implements DocumentStore, RevisionStore {
     } finally { release() }
   }
   async latest(documentId: string) {
-    return this.rows.filter(row => row.documentId === documentId && !row.deleted).sort((a, b) => b.version - a.version || b.id.localeCompare(a.id))[0] ?? null
+    const row = this.rows.filter(row => row.documentId === documentId && !row.deleted).sort((a, b) => b.version - a.version || b.id.localeCompare(a.id))[0]
+    return row ? { id: row.id, contentHash: row.contentHash ?? '', title: row.title } : null
   }
   async get(documentId: string, revisionId: string) {
     return this.rows.find(row => row.documentId === documentId && row.id === revisionId) ?? null
+  }
+  async getDetailRow(documentId: string, revisionId: string) {
+    const row = await this.get(documentId, revisionId)
+    if (!row) return null
+    const { state: _state, ...metadata } = row
+    return { ...metadata, stateBytes: row.state.byteLength }
+  }
+  async getState(documentId: string, revisionId: string) {
+    return (await this.get(documentId, revisionId))?.state ?? null
+  }
+  async backfillProjectionIfMissing(documentId: string, revisionId: string, projection: {
+    contentJson: string; contentHash: string; schemaVersion: number; attribution: unknown | null
+  }) {
+    if (this.backfillFailure) throw new Error('write failed')
+    const index = this.rows.findIndex(row => row.documentId === documentId && row.id === revisionId)
+    if (index < 0 || this.rows[index].contentJson !== null) return false
+    this.rows[index] = { ...this.rows[index], ...projection }
+    return true
   }
   async list(documentId: string, cursor: { version: number; id: string } | null, limit: number): Promise<readonly RevisionListRow[]> {
     return this.rows
@@ -105,7 +126,7 @@ class Memory implements DocumentStore, RevisionStore {
   }
 }
 
-function service(memory: Memory, options: { roomReset?: { flushAndReset: (id: string, reason: string, work: () => Promise<void>) => Promise<void> }; makeId?: () => string } = {}) {
+function service(memory: Memory, options: { roomReset?: { flushAndReset: (id: string, reason: string, work: () => Promise<void>) => Promise<void> }; makeId?: () => string; projectionDecoder?: RevisionProjectionDecoder; onProjectionError?: V2HistoryOptions['onProjectionError'] } = {}) {
   let next = 0
   const scheduled: Array<{ kind: string; documentId: string }> = []
   const api = new V2HistoryService({
@@ -118,7 +139,9 @@ function service(memory: Memory, options: { roomReset?: { flushAndReset: (id: st
     roomReset: options.roomReset ?? { flushAndReset: async (_id, _reason, work) => { await work() } },
     makeId: options.makeId ?? (() => `r${++next}`),
     now: () => new Date('2026-02-01T00:00:00.000Z'),
-  })
+    projectionDecoder: options.projectionDecoder,
+    onProjectionError: options.onProjectionError,
+  } as V2HistoryOptions)
   return { api, scheduled }
 }
 
@@ -202,6 +225,227 @@ describe('V2 persistence and materialization', () => {
     expect(current.availability).toBe('legacy_pending')
     expect(current.diffEligible).toBe(false)
     expect(current.content).toBeNull()
+  })
+
+  it('decodes a state-only revision, returns canonical JSON and conditionally backfills without changing source or mtime', async () => {
+    const memory = new Memory()
+    const originalMtime = new Date('2026-01-20T00:00:00Z')
+    memory.rows.push({
+      id: 'r-state', documentId: 'doc-public', version: 0, type: 'auto', name: null,
+      title: 'Before', contentJson: null, contentHash: null, schemaVersion: null,
+      sourceFormat: 'state_only', state, createdBy: null, contributors: [],
+      attribution: null, ctime: originalMtime, mtime: originalMtime, deleted: false,
+      restoredFromRevisionId: null,
+    } as RevisionRecord)
+    const attribution = { kind: 'whole', author: 'author-a' }
+    const decode = vi.fn(async (bytes: Uint8Array) => ({
+      ...await decodeV2Projection(bytes, schema), attribution,
+    }))
+    const { api } = service(memory, { projectionDecoder: { decode } })
+    const first = await api.detail({ documentId: 'doc-public' }, 'r-state')
+    expect(first.availability).toBe('ready')
+    expect(first.decodedFromState).toBe(true)
+    expect(first.content).toEqual(canonical.json)
+    expect(first.contentHash).toBe(canonical.contentHash)
+    expect(first.attribution).toEqual(attribution)
+    expect(first.restorable).toBe(true)
+    expect(memory.rows[0]).toMatchObject({
+      contentJson: canonical.serialized, contentHash: canonical.contentHash,
+      schemaVersion: 1, sourceFormat: 'state_only', attribution,
+    })
+    expect(memory.rows[0].state).toBe(state)
+    expect(memory.rows[0].mtime).toBe(originalMtime)
+    const second = await api.detail({ documentId: 'doc-public' }, 'r-state')
+    expect(second.decodedFromState).toBe(false)
+    expect(second.contentHash).toBe(first.contentHash)
+    expect(decode).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps decoded detail usable when CAS loses or the backfill write fails', async () => {
+    const memory = new Memory()
+    memory.rows.push({
+      id: 'r-state', documentId: 'doc-public', version: 0, type: 'manual', name: null,
+      title: 'Before', contentJson: null, contentHash: null, schemaVersion: null,
+      sourceFormat: 'state_only', state, createdBy: null, contributors: [], attribution: null,
+      ctime: new Date(), mtime: new Date(), deleted: false, restoredFromRevisionId: null,
+    } as RevisionRecord)
+    const decoder = { decode: (bytes: Uint8Array) => decodeV2Projection(bytes, schema) }
+    memory.backfillFailure = true
+    const { api } = service(memory, { projectionDecoder: decoder })
+    expect((await api.detail({ documentId: 'doc-public' }, 'r-state')).decodedFromState).toBe(true)
+    expect(memory.rows[0].contentJson).toBeNull()
+    memory.backfillFailure = false
+    memory.backfillProjectionIfMissing = async () => false
+    expect((await api.detail({ documentId: 'doc-public' }, 'r-state')).availability).toBe('ready')
+  })
+
+  it('bounds state-only decode, marks conversion failures unavailable, and preserves restorability', async () => {
+    const memory = new Memory()
+    memory.rows.push({
+      id: 'r-state', documentId: 'doc-public', version: 0, type: 'auto', name: null,
+      title: 'Before', contentJson: null, contentHash: null, schemaVersion: null,
+      sourceFormat: 'state_only', state: new Uint8Array(5 * 1024 * 1024 + 1),
+      createdBy: null, contributors: [], attribution: null,
+      ctime: new Date(), mtime: new Date(), deleted: false, restoredFromRevisionId: null,
+    } as RevisionRecord)
+    const decode = vi.fn(async () => decodeV2Projection(state, schema))
+    const { api } = service(memory, { projectionDecoder: { decode } })
+    const oversized = await api.detail({ documentId: 'doc-public' }, 'r-state')
+    expect(oversized).toMatchObject({ availability: 'legacy_failed', diffEligible: false, restorable: true, content: null })
+    expect(decode).not.toHaveBeenCalled()
+    memory.rows[0] = { ...memory.rows[0], state }
+    decode.mockRejectedValueOnce(new Error('bad state'))
+    const failed = await api.detail({ documentId: 'doc-public' }, 'r-state')
+    expect(failed).toMatchObject({ availability: 'legacy_failed', diffEligible: false, restorable: true, content: null })
+  })
+
+  it('surfaces decoder saturation as a retryable 503-style error', async () => {
+    const memory = new Memory()
+    memory.rows.push({
+      id: 'r-state', documentId: 'doc-public', version: 0, type: 'auto', name: null,
+      title: 'Before', contentJson: null, contentHash: null, schemaVersion: null,
+      sourceFormat: 'state_only', state, createdBy: null, contributors: [], attribution: null,
+      ctime: new Date(), mtime: new Date(), deleted: false, restoredFromRevisionId: null,
+    } as RevisionRecord)
+    const { api } = service(memory, { projectionDecoder: {
+      decode: async () => { throw new RevisionProjectionBusyError() },
+    } })
+    await expect(api.detail({ documentId: 'doc-public' }, 'r-state')).rejects.toMatchObject({
+      name: 'RevisionProjectionBusyError', statusCode: 503, retryable: true,
+    })
+    expect(memory.rows[0].contentJson).toBeNull()
+  })
+
+  it('decodes V2 state once and derives attribution from the same canonical tree', async () => {
+    const derive = vi.fn((_doc: Y.Doc, projected: { serialized: string; contentHash: string }) => {
+      expect(projected.serialized).toBe(canonical.serialized)
+      expect(projected.contentHash).toBe(canonical.contentHash)
+      return { kind: 'whole', author: 'author-a' }
+    })
+    const decoded = await decodeV2Projection(state, schema, derive)
+    expect(decoded).toMatchObject({ content: canonical.json, contentJson: canonical.serialized,
+      contentHash: canonical.contentHash, schemaVersion: 1,
+      attribution: { kind: 'whole', author: 'author-a' }, attributionComplete: true })
+    expect(derive).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not persist a partial projection when optional attribution derivation fails', async () => {
+    const memory = new Memory()
+    memory.rows.push({
+      id: 'r-state', documentId: 'doc-public', version: 0, type: 'auto', name: null,
+      title: 'Before', contentJson: null, contentHash: null, schemaVersion: null,
+      sourceFormat: 'state_only', state, createdBy: null, contributors: [], attribution: null,
+      ctime: new Date(), mtime: new Date(), deleted: false, restoredFromRevisionId: null,
+    } as RevisionRecord)
+    let failAttribution = true
+    const diagnostics = vi.fn()
+    const { api } = service(memory, { projectionDecoder: {
+      decode: bytes => decodeV2Projection(bytes, schema, () => {
+        if (failAttribution) throw new Error('attribution extraction failed')
+        return { kind: 'whole', author: 'author-a' }
+      }),
+    }, onProjectionError: diagnostics })
+    const first = await api.detail({ documentId: 'doc-public' }, 'r-state')
+    expect(first).toMatchObject({ availability: 'ready', decodedFromState: true, attribution: null })
+    expect(memory.rows[0].contentJson).toBeNull()
+    expect(diagnostics).toHaveBeenCalledWith('attribution', 'Error')
+    failAttribution = false
+    const second = await api.detail({ documentId: 'doc-public' }, 'r-state')
+    expect(second.attribution).toEqual({ kind: 'whole', author: 'author-a' })
+    expect(memory.rows[0].contentJson).toBe(canonical.serialized)
+  })
+
+  it('does not expose content if a revision is soft-deleted during state decoding', async () => {
+    const memory = new Memory()
+    memory.rows.push({
+      id: 'r-state', documentId: 'doc-public', version: 0, type: 'auto', name: null,
+      title: 'Before', contentJson: null, contentHash: null, schemaVersion: null,
+      sourceFormat: 'state_only', state, createdBy: null, contributors: [], attribution: null,
+      ctime: new Date(), mtime: new Date(), deleted: false, restoredFromRevisionId: null,
+    } as RevisionRecord)
+    memory.backfillProjectionIfMissing = async () => false
+    const { api } = service(memory, { projectionDecoder: { decode: async bytes => {
+      memory.rows[0] = { ...memory.rows[0], deleted: true }
+      return decodeV2Projection(bytes, schema)
+    } } })
+    const detail = await api.detail({ documentId: 'doc-public' }, 'r-state')
+    expect(detail).toMatchObject({ availability: 'deleted', diffEligible: false, restorable: false,
+      content: null, contentHash: null, attribution: null, decodedFromState: false })
+  })
+
+  it('consumes worker-canonical content without traversing the tree on the service thread', async () => {
+    const memory = new Memory()
+    memory.rows.push({
+      id: 'r-state', documentId: 'doc-public', version: 0, type: 'auto', name: null,
+      title: 'Before', contentJson: null, contentHash: null, schemaVersion: null,
+      sourceFormat: 'state_only', state, createdBy: null, contributors: [], attribution: null,
+      ctime: new Date(), mtime: new Date(), deleted: false, restoredFromRevisionId: null,
+    } as RevisionRecord)
+    const content = new Proxy({ type: 'doc' }, {
+      get(target, key) {
+        if (key === 'content') throw new Error('service traversed worker tree')
+        return Reflect.get(target, key)
+      },
+    })
+    const { api } = service(memory, { projectionDecoder: { decode: async () => ({
+      content, contentJson: canonical.serialized, contentHash: canonical.contentHash,
+      schemaVersion: 1, attribution: null, attributionComplete: true,
+    }) } })
+    const detail = await api.detail({ documentId: 'doc-public' }, 'r-state')
+    expect(detail.availability).toBe('ready')
+    expect(detail.contentHash).toBe(canonical.contentHash)
+  })
+
+  it('keeps stored whole-document credit when state projection derives different credit', async () => {
+    const memory = new Memory()
+    memory.rows.push({
+      id: 'r-state', documentId: 'doc-public', version: 0, type: 'restore', name: null,
+      title: 'Before', contentJson: null, contentHash: null, schemaVersion: null,
+      sourceFormat: 'state_only', state, createdBy: 'restorer', contributors: [],
+      attribution: { kind: 'whole', author: 'restorer' },
+      ctime: new Date(), mtime: new Date(), deleted: false, restoredFromRevisionId: null,
+    } as RevisionRecord)
+    const { api } = service(memory, { projectionDecoder: { decode: bytes => decodeV2Projection(bytes, schema,
+      () => ({ kind: 'ranges', ranges: [{ from: 0, to: 1, author: 'original' }] })) } })
+    const detail = await api.detail({ documentId: 'doc-public' }, 'r-state')
+    expect(detail.attribution).toEqual({ kind: 'whole', author: 'restorer' })
+    expect(memory.rows[0].attribution).toEqual(detail.attribution)
+  })
+
+  it('keeps recorded deletion credit alongside newly derived ranges', async () => {
+    const memory = new Memory()
+    memory.rows.push({
+      id: 'r-state', documentId: 'doc-public', version: 0, type: 'auto', name: null,
+      title: 'Before', contentJson: null, contentHash: null, schemaVersion: null,
+      sourceFormat: 'state_only', state, createdBy: null, contributors: [],
+      attribution: { kind: 'ranges', ranges: [], deletions: [{ at: 2, author: 'deleter' }] },
+      ctime: new Date(), mtime: new Date(), deleted: false, restoredFromRevisionId: null,
+    } as RevisionRecord)
+    const { api } = service(memory, { projectionDecoder: { decode: bytes => decodeV2Projection(bytes, schema,
+      () => ({ kind: 'ranges', ranges: [{ from: 0, to: 1, author: 'writer' }] })) } })
+    const detail = await api.detail({ documentId: 'doc-public' }, 'r-state')
+    expect(detail.attribution).toEqual({
+      kind: 'ranges', ranges: [{ from: 0, to: 1, author: 'writer' }],
+      deletions: [{ at: 2, author: 'deleter' }],
+    })
+    expect(memory.rows[0].attribution).toEqual(detail.attribution)
+  })
+
+  it('restores a valid state-only revision even when no projection decoder is configured', async () => {
+    const memory = new Memory()
+    const targetState = yState('after', 'After')
+    memory.rows.push({
+      id: 'r-state', documentId: 'doc-public', version: 0, type: 'manual', name: null,
+      title: 'After', contentJson: null, contentHash: null, schemaVersion: null,
+      sourceFormat: 'state_only', state: targetState, createdBy: null, contributors: [],
+      attribution: null, ctime: new Date('2026-01-20T00:00:00Z'),
+      mtime: new Date('2026-01-20T00:00:00Z'), deleted: false, restoredFromRevisionId: null,
+    } as RevisionRecord)
+    const { api } = service(memory)
+    expect((await api.detail({ documentId: 'doc-public' }, 'r-state')).restorable).toBe(true)
+    expect(await api.restore({ documentId: 'doc-public', actorId: 'restorer' }, 'r-state')).toEqual({ id: 'r-state' })
+    expect([...memory.current.state!]).toEqual([...targetState])
+    expect(memory.rows.map(row => row.type)).toEqual(['manual', 'pre_restore', 'restore'])
   })
 
   it('feeds list and detail wire responses into the ported frontend API client', async () => {
