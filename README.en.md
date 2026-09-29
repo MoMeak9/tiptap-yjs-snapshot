@@ -19,6 +19,8 @@ A runnable local Tiptap + Yjs demo remains in the repository so readers can obse
 | `src/server/`, `src/client/` | End-to-end local demo with file storage, WebSocket, REST, and a StarterKit editor |
 | `docs/` | [Architecture](docs/architecture.en.md), [data and API contract](docs/contract.en.md), [source mapping and adaptation boundary](docs/v2-extraction.en.md) |
 
+Chinese long-form article draft: [Why revision history stores both Yjs state and JSON](docs/articles/v2-revision-history-wechat.zh-CN.md), with two exportable diagrams.
+
 ## Run locally
 
 Node.js **22.13 or newer** is required. The project's `.npmrc` uses the Taobao npm mirror at `https://registry.npmmirror.com/`; the install command also specifies it explicitly.

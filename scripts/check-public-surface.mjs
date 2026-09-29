@@ -16,6 +16,8 @@ const failures = []
 function visit(directory) {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     if (skipped.has(entry.name)) continue
+    // Archify browser-check sidecars are local, ignored QA evidence, not public artifacts.
+    if (entry.name.includes('.visual-check.')) continue
     const path = join(directory, entry.name)
     if (entry.isDirectory()) {
       visit(path)

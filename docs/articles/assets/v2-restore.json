@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "V2 修订恢复：替换状态并切断旧会话",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [1080, 625]
+  },
+  "participants": [
+    { "id": "client", "type": "frontend", "label": "编辑器客户端", "sublabel": "历史面板与 Y.Doc" },
+    { "id": "host", "type": "security", "label": "宿主 API", "sublabel": "身份与文档授权" },
+    { "id": "core", "type": "backend", "label": "V2HistoryService", "sublabel": "恢复编排" },
+    { "id": "room", "type": "backend", "label": "RoomReset 适配器", "sublabel": "房间围栏与广播" },
+    { "id": "store", "type": "database", "label": "文档 / 修订库", "sublabel": "共享事务与行锁" }
+  ],
+  "segments": [
+    { "from": 150, "to": 265, "label": "授权与目标校验" },
+    { "from": 270, "to": 435, "label": "受保护的原子替换" },
+    { "from": 440, "to": 565, "label": "旧会话失效并重连" }
+  ],
+  "messages": [
+    { "id": "request", "from": "client", "to": "host", "y": 160, "label": "恢复请求：目标修订 id", "variant": "emphasis" },
+    { "id": "invoke", "from": "host", "to": "core", "y": 189, "label": "鉴权后 restore(context, id)", "variant": "security" },
+    { "id": "target", "from": "core", "to": "store", "y": 218, "label": "读取目标原始 V2 state" },
+    { "id": "validate", "from": "store", "to": "core", "y": 247, "label": "解码校验；派生 JSON / 标题", "variant": "return" },
+    { "id": "gate", "from": "core", "to": "room", "y": 276, "label": "flushAndReset(work)", "variant": "emphasis" },
+    { "id": "callback", "from": "room", "to": "core", "y": 305, "label": "围栏全部实例；flush 后执行 work" },
+    { "id": "protect", "from": "core", "to": "store", "y": 334, "label": "BEGIN / 行锁；变化时写 pre_restore", "variant": "emphasis" },
+    { "id": "replace", "from": "core", "to": "store", "y": 363, "label": "写原始 V2 state + 规范 JSON / 标题", "variant": "emphasis" },
+    { "id": "audit", "from": "core", "to": "store", "y": 392, "label": "写 restore 来源审计" },
+    { "id": "commit", "from": "store", "to": "core", "y": 421, "label": "COMMIT；三项同一事务", "variant": "return" },
+    { "id": "reset", "from": "room", "to": "client", "y": 450, "label": "通知旧客户端重建（如 document.reset / 4205）", "variant": "emphasis" },
+    { "id": "result", "from": "core", "to": "host", "y": 479, "label": "返回目标修订 id", "variant": "return" },
+    { "id": "response", "from": "host", "to": "client", "y": 508, "label": "响应：目标修订 id", "variant": "return" },
+    { "id": "reconnect", "from": "client", "to": "room", "y": 537, "label": "丢弃旧 Y.Doc / 缓存；新建 provider 重连", "variant": "emphasis" }
+  ]
+}

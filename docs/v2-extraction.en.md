@@ -50,7 +50,7 @@ The public code retains data types and service handling for `open_api`, automati
 
 Complete Yjs V2 state is authoritative for restore. The service decodes and canonicalizes the target, preserves pre-restore content, then writes back the target's original state. The `RoomReset` implementation must prevent the old room from continuing to write, notify and disconnect connected clients. Clients destroy the old editor, Y.Doc, and provider, clear the document's offline cache, and reconnect. Directly applying the target update to an old Y.Doc merges two CRDT histories and cannot guarantee an exact restore.
 
-The public service requires a successful pre-restore protection write before replacement. It writes the restore-source audit after room reset; the host needs alerting and compensation for audit failure. This order differs from the local demo's single-file write, so the demo's atomic file replacement is not a production transaction guarantee.
+The public service requires a successful pre-restore protection write before replacement. Once `RoomReset` blocks stale room writes, the protection revision, target state replacement, and restore-source audit are written in one document transaction; failure at any step rolls that transaction back. After commit, the host broadcasts reset and disconnects live clients. The local demo uses an atomic file replacement, which is not a substitute for a production database transaction.
 
 ## Verification scope
 

@@ -19,6 +19,8 @@
 | `src/server/`、`src/client/` | 本机文件存储、WebSocket、REST 与 StarterKit 编辑器组成的端到端演示 |
 | `docs/` | [架构流程](docs/architecture.zh-CN.md)、[数据与接口契约](docs/contract.zh-CN.md)、[来源映射与适配边界](docs/v2-extraction.zh-CN.md) |
 
+技术公众号长文草稿：[在 Yjs 协同编辑器里做版本历史：为什么要同时保存 state 和 JSON？](docs/articles/v2-revision-history-wechat.zh-CN.md)，含两张可导出的机制示意图。
+
 ## 本机运行
 
 需要 Node.js **22.13 或更新版本**。项目的 `.npmrc` 使用淘宝 npm 镜像 `https://registry.npmmirror.com/`；也可以在安装命令中显式指定。

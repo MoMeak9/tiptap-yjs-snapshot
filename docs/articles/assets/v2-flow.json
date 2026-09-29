@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "V2 修订历史：从协同文档到只读历史",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1070, 520]
+  },
+  "stages": [
+    { "label": "实时编辑" },
+    { "label": "同源提取" },
+    { "label": "当前状态与触发" },
+    { "label": "不可变修订" },
+    { "label": "读取与展示" }
+  ],
+  "nodes": [
+    { "id": "liveDoc", "type": "backend", "label": "协同服务 Y.Doc", "sublabel": "Tiptap 正文与标题", "stage": 0, "row": 1, "tag": "宿主协同层" },
+    { "id": "v2State", "type": "backend", "label": "完整 Yjs V2 state", "sublabel": "可恢复的原始状态", "stage": 1, "row": 0, "tag": "v2-core" },
+    { "id": "canonicalJson", "type": "backend", "label": "规范化 JSON + 哈希", "sublabel": "同一 Y.Doc 的可见内容", "stage": 1, "row": 2, "tag": "v2-core" },
+    { "id": "currentStore", "type": "database", "label": "当前文档持久化", "sublabel": "state、JSON、标题与哈希", "stage": 2, "row": 1, "tag": "宿主存储适配" },
+    { "id": "materialize", "type": "backend", "label": "延迟 / 手动物化", "sublabel": "锁内判重或手动书签", "stage": 2, "row": 2, "tag": "v2-core" },
+    { "id": "revision", "type": "database", "label": "不可变修订行", "sublabel": "双表示与元数据", "stage": 3, "row": 2, "tag": "宿主存储适配" },
+    { "id": "api", "type": "backend", "label": "列表 / 详情 API", "sublabel": "列表元数据，详情 JSON", "stage": 4, "row": 0, "tag": "v2-core → 宿主 HTTP" },
+    { "id": "viewer", "type": "frontend", "label": "独立只读查看器", "sublabel": "历史 JSON + 结构化差异", "stage": 4, "row": 2, "tag": "revision-history" }
+  ],
+  "flows": [
+    { "from": "liveDoc", "to": "v2State", "label": "编码完整状态", "variant": "emphasis" },
+    { "from": "liveDoc", "to": "canonicalJson", "label": "读取并规范化", "variant": "emphasis" },
+    { "from": "v2State", "to": "currentStore", "label": "保存原始 state", "variant": "emphasis" },
+    { "from": "canonicalJson", "to": "currentStore", "label": "保存 JSON / 哈希", "variant": "emphasis" },
+    { "from": "currentStore", "to": "materialize", "label": "持久化成功后调度", "variant": "default", "labelDy": 24 },
+    { "from": "materialize", "to": "revision", "label": "锁内创建版本", "variant": "emphasis" },
+    { "from": "revision", "to": "api", "label": "按版本读取", "variant": "default" },
+    { "from": "api", "to": "viewer", "label": "选中版本后获取详情", "variant": "emphasis", "labelDy": 24 }
+  ]
+}
